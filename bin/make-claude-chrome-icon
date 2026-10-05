@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""make-claude-chrome-icon <out.icns> [--account NAME] [--badge TAG] [--base <chrome app.icns>]
+
+Renders an icon from the locally installed Chrome's own app.icns, desaturated
+and blue-tinted so it never reads as your everyday Chrome, with an "AI" badge
+bottom-right. With --account, a second badge top-left: a colored disc carrying
+the account tag (--badge, default "C" + the digits in the name: team1 → "C1"),
+one color per account so the Dock tells them apart at a glance. With --label
+(and --sublabel), a plate bottom-left names the instance's purpose and origin.
+Needs Pillow.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+
+PALETTE = [  # disc colors: numbered accounts take them in order
+    (214, 69, 69),
+    (230, 140, 30),
+    (40, 160, 90),
+    (55, 120, 230),
+    (150, 70, 200),
+    (20, 150, 160),
+    (200, 60, 140),
+    (120, 110, 40),
+]
+
+
+def disc_color(account):
+    """Accounts with a number use it (team3 → third color); others hash their name."""
+    digits = "".join(ch for ch in account if ch.isdigit())
+    n = int(digits) - 1 if digits else sum(map(ord, account))
+    return PALETTE[n % len(PALETTE)]
+
+
+def default_badge(account):
+    digits = "".join(ch for ch in account if ch.isdigit())
+    return ("C" + digits) if digits else account[:2].upper()
+FONT = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+
+
+def base_png(chrome_icns, tmp):
+    iconset = os.path.join(tmp, "chrome.iconset")
+    subprocess.run(["iconutil", "-c", "iconset", chrome_icns, "-o", iconset], check=True, capture_output=True)
+    biggest = max((os.path.join(iconset, f) for f in os.listdir(iconset) if f.endswith(".png")), key=os.path.getsize)
+    return Image.open(biggest).convert("RGBA")
+
+
+def render(base, account=None, W=1024, label=None, sublabel=None, badge=None):
+    base = base.resize((W, W), Image.LANCZOS)
+    img = ImageEnhance.Color(base).enhance(0.15)
+    tint = Image.new("RGBA", (W, W), (60, 90, 200, 80))
+    tint.putalpha(Image.eval(base.split()[3], lambda a: int(a * 0.31)))
+    img = Image.alpha_composite(img, tint)
+    d = ImageDraw.Draw(img)
+    # AI badge, bottom-right
+    bw = 420
+    x0, y0 = W - bw - 40, W - bw - 40
+    d.rounded_rectangle([x0, y0, x0 + bw, y0 + bw], radius=90, fill=(20, 20, 28, 235), outline=(255, 255, 255, 255), width=14)
+    f = ImageFont.truetype(FONT, 220)
+    tw, th = d.textbbox((0, 0), "AI", font=f)[2:]
+    d.text((x0 + (bw - tw) / 2, y0 + (bw - th) / 2 - 18), "AI", font=f, fill=(255, 255, 255, 255))
+    # account disc, top-left
+    if account:
+        digit = (badge or default_badge(account))[:3]
+        col = disc_color(account)
+        r = 230
+        cx, cy = 50 + r, 50 + r
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col + (255,), outline=(255, 255, 255, 255), width=16)
+        f2 = ImageFont.truetype(FONT, 230)
+        tw, th = d.textbbox((0, 0), digit, font=f2)[2:]
+        d.text((cx - tw / 2, cy - th / 2 - 28), digit, font=f2, fill=(255, 255, 255, 255))
+    # purpose + origin plate, bottom-left: what the instance is doing and
+    # where the agent driving it runs
+    if label:
+        lx0, ly0, lx1, ly1 = 36, 600, W - 420 - 40 - 24, W - 36
+        d.rounded_rectangle([lx0, ly0, lx1, ly1], radius=70, fill=(245, 245, 250, 240), outline=(30, 30, 40, 255), width=12)
+        def fit(text, size, maxw):
+            while size > 60:
+                f = ImageFont.truetype(FONT, size)
+                if d.textbbox((0, 0), text, font=f)[2] <= maxw:
+                    return f
+                size -= 10
+            return ImageFont.truetype(FONT, 60)
+        maxw = lx1 - lx0 - 50
+        f3 = fit(label[:14], 190 if not sublabel else 170, maxw)
+        tw, th = d.textbbox((0, 0), label[:14], font=f3)[2:]
+        ty = ly0 + 40 if sublabel else ly0 + (ly1 - ly0 - th) / 2 - 20
+        d.text((lx0 + (lx1 - lx0 - tw) / 2, ty), label[:14], font=f3, fill=(20, 20, 28, 255))
+        if sublabel:
+            f4 = fit(sublabel[:16], 120, maxw)
+            tw2 = d.textbbox((0, 0), sublabel[:16], font=f4)[2]
+            d.text((lx0 + (lx1 - lx0 - tw2) / 2, ly1 - 40 - 130), sublabel[:16], font=f4, fill=(60, 60, 80, 255))
+    return img
+
+
+def write_icns(img, out):
+    with tempfile.TemporaryDirectory() as tmp:
+        iconset = os.path.join(tmp, "x.iconset")
+        os.makedirs(iconset)
+        for s in (16, 32, 128, 256, 512):
+            img.resize((s, s), Image.LANCZOS).save(os.path.join(iconset, f"icon_{s}x{s}.png"))
+            img.resize((s * 2, s * 2), Image.LANCZOS).save(os.path.join(iconset, f"icon_{s}x{s}@2x.png"))
+        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", out], check=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    ap.add_argument("--account")
+    ap.add_argument("--base", default="/Applications/Google Chrome.app/Contents/Resources/app.icns")
+    ap.add_argument("--png", help="also write a 1024px preview PNG here")
+    ap.add_argument("--label", help="purpose word drawn on a plate bottom-left")
+    ap.add_argument("--sublabel", help="second line on the plate, e.g. the terminal pane")
+    ap.add_argument("--badge", help="text on the account disc (default C + the digits in --account)")
+    a = ap.parse_args()
+    with tempfile.TemporaryDirectory() as tmp:
+        img = render(base_png(a.base, tmp), a.account, label=a.label, sublabel=a.sublabel, badge=a.badge)
+    if a.png:
+        img.save(a.png)
+    write_icns(img, a.out)
+    print(f"wrote {a.out}" + (f" (account {a.account})" if a.account else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

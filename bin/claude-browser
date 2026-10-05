@@ -1,0 +1,1391 @@
+#!/usr/bin/env python3
+"""claude-browser — one Chrome instance per Claude Code session, already signed in.
+
+Why this exists
+---------------
+The Claude in Chrome extension pairs per Chrome PROFILE and per Claude ACCOUNT.
+Running one profile per Claude account inside your everyday Chrome means (a) the
+profile is loaded for as long as that Chrome runs, so nothing can safely write
+cookies into it, and (b) nothing tells you which Claude session is driving which
+browser.
+
+This tool gives each session its own Chrome INSTANCE (own --user-data-dir),
+cloned on demand from a shared BASE plus a small per-account pairing OVERLAY.
+Because the clone is a fresh, unloaded directory, the cookies the session needs
+are copied into it *before* Chrome opens it: the account's claude.ai session from
+that account's profile in your main Chrome, and site cookies for the hosts the
+agent declares. The window, Dock icon and first tab name the session and its
+purpose. At session end the instance is deleted.
+
+Layout (under the root, default ~/Library/Application Support/Chrome-Claude/):
+  templates/_base/                shared parent: Chrome skeleton + Claude extension, NO identity
+  templates/<account>/            overlay: the account's pairing (extension local storage) + overlay.json
+  sessions/<session-id>/          per-session instance = clone of _base + overlay + copied cookies
+  sessions/<session-id>/instance.json, instance-card.html
+  icons/                          generated Dock icons (from your installed Chrome's icon)
+  events.log                      append-only record of refusals, launches, pairings, teardowns
+Config: ~/.config/claude-browser/config.json (or $CLAUDE_BROWSER_CONFIG); see `claude-browser config`.
+
+Subcommands
+  template init               create the base; one human click, once per Mac (Add to Chrome)
+  template pair <account>     add an account: base clone signed in from the account's main-Chrome
+                              profile; a human clicks the extension once; pairing saved as overlay
+  template check <account>    base + overlay ready?
+  template list
+  up --purpose W --sites H[,H] [--account A] [--session S] [--origin T] [--no-graft] [--new-device-id]
+                              clone base + overlay, copy ONLY those hosts' cookies from the site-cookie
+                              source profile, refresh claude.* from the account's main-Chrome profile,
+                              launch, wait for the relay registration, print the device id.
+  down [<session>] [--all]    kill that instance's Chrome and delete its dir
+  list [--json]               instances: session, account, purpose, running, origin, device id
+  resolve <device-id>         which session/account/purpose owns this device id
+  events [--since H] [--json] the event log
+  gc [--older-than HOURS]     tear down instances that are dead or old
+  app build|check             icon-bearing Chrome copies used for agent instances
+  config                      print the effective configuration
+  test device-id <account>    does a reset clone pair unattended?
+
+Exit codes: 0 ok · 1 usage/precondition · 2 template not ready (human step) ·
+3 instance failed to come up.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+__version__ = "0.1.0"
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
+                             os.path.join(HOME, ".config", "claude-browser", "config.json"))
+
+
+def _load_config():
+    """Optional overrides; every key has a default (see `claude-browser config`)."""
+    try:
+        with open(CONFIG_PATH) as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+CFG = _load_config()
+
+
+def _path(key, default):
+    v = CFG.get(key)
+    return os.path.expanduser(v) if v else default
+
+
+ROOT = _path("root", os.path.join(HOME, "Library", "Application Support", "Chrome-Claude"))
+TEMPLATES = os.path.join(ROOT, "templates")
+BASE = os.path.join(TEMPLATES, "_base")        # shared parent: Chrome skeleton + Claude extension, no identity
+SESSIONS = os.path.join(ROOT, "sessions")
+ICON_DIR = os.path.join(ROOT, "icons")
+EVENTS = os.path.join(ROOT, "events.log")
+MAIN_CHROME = _path("main_chrome_dir", os.path.join(HOME, "Library", "Application Support", "Google", "Chrome"))
+SITE_COOKIE_SOURCE = CFG.get("site_cookie_source") or "Default"   # profile dir in main Chrome holding site logins
+CHROME_APP = "Google Chrome"
+CHROME_APP_SRC = _path("chrome_app_src", "/Applications/Google Chrome.app")
+APPS_DIR = _path("apps_dir", os.path.join(HOME, "Applications"))
+# A byte-identical APFS clone of Google Chrome.app with a custom Finder icon, so
+# agent browsers get their own Dock icon. The clone keeps Google's signature
+# (non-strict verify passes; Keychain hands over "Chrome Safe Storage" without
+# a prompt). Rebuild after Chrome updates: `claude-browser app build`.
+CHROME_APP_COPY = os.path.join(APPS_DIR, "Chrome Claude.app")
+INSTANCE_APPS = os.path.join(APPS_DIR, "Chrome Claude Instances")
+REGISTRY = _path("registry", None)
+NMH_MAIN = _path("native_messaging_hosts", os.path.join(MAIN_CHROME, "NativeMessagingHosts"))
+EXT_CLAUDE = CFG.get("extension_id") or "fcoeoabgfenejglbffodgkkbkcdhcgfn"      # Claude in Chrome (Web Store id)
+# anthropic.com is deliberately absent: the Console session there can mint API
+# keys and change billing, and the extension does not need it.
+CLAUDE_HOSTS = CFG.get("claude_hosts") or ["claude.ai", "*.claude.ai", "claude.com", "*.claude.com",
+                                           "claudeusercontent.com", "*.claudeusercontent.com"]
+ALLOWED_SITES = [x.lower() for x in (CFG.get("allowed_sites") or [])]
+DENIED_SITES = [x.lower() for x in (CFG.get("denied_sites") or [])]
+GRAFTER = _path("grafter", None) or shutil.which("chrome-cookie-graft") or "chrome-cookie-graft"
+ICON_MAKER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "make-claude-chrome-icon")
+LSOF = "/usr/sbin/lsof"
+TRASH = shutil.which("trash")
+
+
+def effective_config():
+    return {
+        "config_file": CONFIG_PATH + ("" if os.path.exists(CONFIG_PATH) else " (absent: all defaults)"),
+        "root": ROOT,
+        "main_chrome_dir": MAIN_CHROME,
+        "site_cookie_source": SITE_COOKIE_SOURCE,
+        "accounts": accounts_map(),
+        "registry": REGISTRY,
+        "account_detector": CFG.get("account_detector"),
+        "origin_command": CFG.get("origin_command"),
+        "extension_id": EXT_CLAUDE,
+        "chrome_app_src": CHROME_APP_SRC,
+        "apps_dir": APPS_DIR,
+        "native_messaging_hosts": NMH_MAIN,
+        "grafter": GRAFTER,
+        "claude_hosts": CLAUDE_HOSTS,
+        "allowed_sites": ALLOWED_SITES or None,
+        "denied_sites": DENIED_SITES or None,
+    }
+
+
+# ----------------------------------------------------------------- accounts
+
+def _account_entries():
+    """config `accounts`: {"<account>": "<profile dir>"} or
+    {"<account>": {"profile": "<profile dir>", "badge": "W"}}."""
+    out = {}
+    for name, v in (CFG.get("accounts") or {}).items():
+        out[name] = {"profile": v} if isinstance(v, str) else dict(v or {})
+    return out
+
+
+def _registry_accounts():
+    """Optional fallback for setups that already keep an account registry:
+    a JSON file with accounts.<name>.chrome_profile_dir."""
+    if not REGISTRY:
+        return {}
+    reg = read_json(REGISTRY, {}) or {}
+    return {k: (v or {}).get("chrome_profile_dir") for k, v in (reg.get("accounts") or {}).items()}
+
+
+def accounts_map():
+    """account → main-Chrome profile dir; config first, registry second."""
+    m = {k: v for k, v in _registry_accounts().items() if v}
+    for k, v in _account_entries().items():
+        if v.get("profile"):
+            m[k] = v["profile"]
+    return m
+
+
+def main_chrome_profile_for(account):
+    """Which profile dir inside the main Chrome is signed in to claude.ai as this account?"""
+    return accounts_map().get(account)
+
+
+def known_accounts():
+    names = set(accounts_map())
+    if os.path.isdir(TEMPLATES):
+        names |= {a for a in os.listdir(TEMPLATES) if not a.startswith((".", "_"))
+                  and os.path.isdir(os.path.join(TEMPLATES, a))}
+    return sorted(n for n in names if NAME_RE.fullmatch(n) and ".." not in n)
+
+
+def account_badge(account):
+    """Short tag drawn on the account's Dock icon disc: config `badge`, else
+    "C" + the digits in the name (team2 → C2), else the first two letters."""
+    b = (_account_entries().get(account) or {}).get("badge")
+    if b:
+        return str(b)[:3]
+    digits = re.sub(r"\D", "", account)
+    return ("C" + digits) if digits else (account[:2].upper() or "?")
+
+
+def account_suffix(account):
+    """Name part of the per-account app copy: 'Chrome Claude <suffix>.app'."""
+    return re.sub(r"\D", "", account) or re.sub(r"[^A-Za-z0-9_-]+", "-", account)
+
+
+def session_account():
+    """Which Claude account is this CLI session? $CLAUDE_BROWSER_ACCOUNT, then the
+    config `account_detector` command (its stdout's first word), else unknown."""
+    env = os.environ.get("CLAUDE_BROWSER_ACCOUNT")
+    if env:
+        return env.strip()
+    det = CFG.get("account_detector")
+    if det:
+        # shell=True on purpose: the command comes from the user's own config file
+        # (same trust as the file) and is meant to allow pipelines.
+        r = subprocess.run(det, shell=True, capture_output=True, text=True)  # nosec B602
+        words = r.stdout.split()
+        if r.returncode == 0 and words:
+            return words[0]
+    return None
+
+
+# ----------------------------------------------------------------- helpers
+
+def log_event(kind, **fields):
+    """Append-only JSONL record of every launch, refusal, pairing and teardown.
+    Instances delete themselves on teardown, so this is the only durable
+    trace of who used a browser, for what, and whether it worked."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": kind,
+           "cli_session": os.environ.get("CLAUDE_SESSION_ID"), "pid": os.getpid()}
+    rec.update(fields)
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        with open(EVENTS, "a") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def die(msg, code=1, **fields):
+    if fields:
+        log_event("refused", reason=msg.splitlines()[0][:160], code=code, **fields)
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+# Session ids and account names become directory names under the root, and
+# teardown deletes those directories: anything that could climb out of the
+# root (absolute paths, "..", separators) is refused at the door.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def check_name(kind, value):
+    # fullmatch: `$` would accept a trailing newline. Session ids must be
+    # lowercase too: APFS is case-insensitive, so `down ABC` would resolve to
+    # the dir `abc` while the exact-case process match found nothing to stop.
+    ok = bool(value) and NAME_RE.fullmatch(value) and ".." not in value
+    if ok and kind == "session" and value != value.lower():
+        ok = False
+    if not ok:
+        rule = "lowercase letters, digits" if kind == "session" else "letters, digits"
+        die(f"refusing {kind} {value!r}: use {rule}, '.', '_' or '-' (max 64, no '..')")
+    return value
+
+
+def tdir(account):
+    return os.path.join(TEMPLATES, check_name("account", account))
+
+
+def sdir(session):
+    return os.path.join(SESSIONS, check_name("session", session))
+
+
+def inside(path, parent):
+    """True if PATH resolves to a direct child of PARENT (no symlink escape)."""
+    return os.path.dirname(os.path.realpath(path)) == os.path.realpath(parent)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(obj, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def grafter_ok():
+    return bool(shutil.which(GRAFTER) or os.access(GRAFTER, os.X_OK))
+
+
+def cookies_db(user_data_dir):
+    for p in (os.path.join(user_data_dir, "Default", "Cookies"),
+              os.path.join(user_data_dir, "Default", "Network", "Cookies")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def is_open(user_data_dir):
+    """True if some Chrome process has this user-data-dir's cookie DB open."""
+    db = cookies_db(user_data_dir)
+    if not db:
+        return False
+    return subprocess.run([LSOF, db], capture_output=True).returncode == 0
+
+
+def chrome_pids(user_data_dir):
+    """PIDs whose command line carries exactly --user-data-dir=<dir> (followed by
+    a space or the end), compared as plain text: no regex, so a session that is
+    a prefix of another, or a root path with regex metacharacters, can't match
+    the wrong instance."""
+    flag = f"--user-data-dir={user_data_dir}"
+    out = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        i = cmd.find(flag)
+        while i != -1:
+            end = i + len(flag)
+            if (end == len(cmd) or cmd[end] == " ") and (i == 0 or cmd[i - 1] == " "):
+                if pid.isdigit() and int(pid) != os.getpid():
+                    pids.append(int(pid))
+                break
+            i = cmd.find(flag, i + 1)
+    return pids
+
+
+def kill_instance(user_data_dir, sig=15):
+    for pid in chrome_pids(user_data_dir):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def ext_settings(user_data_dir, ext=EXT_CLAUDE):
+    return os.path.join(user_data_dir, "Default", "Local Extension Settings", ext)
+
+
+def device_id(user_data_dir):
+    return device_id_in_store(ext_settings(user_data_dir))
+
+
+def overlay_store(account):
+    """Where an account's pairing (the extension's local storage) is kept."""
+    return os.path.join(tdir(account), "Local Extension Settings", EXT_CLAUDE)
+
+
+def device_id_in_store(store):
+    """Scrape bridgeDeviceId out of the Claude extension's LevelDB. Newest file
+    last, last match wins (LevelDB keeps superseded records until compaction)."""
+    if not os.path.isdir(store):
+        return None
+    files = sorted((os.path.join(store, f) for f in os.listdir(store)
+                    if f.endswith((".log", ".ldb"))), key=os.path.getmtime)
+    found = None
+    for f in files:
+        try:
+            raw = open(f, "rb").read().decode("latin-1")
+        except OSError:
+            continue
+        for m in re.finditer(r"bridgeDeviceId.{0,48}?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", raw, re.S):
+            found = m.group(1)
+    return found
+
+
+def extension_installed(user_data_dir, ext):
+    return os.path.isdir(os.path.join(user_data_dir, "Default", "Extensions", ext))
+
+
+def _db_has_claude_session(db):
+    """Presence check on a copy of a Cookies DB (the live one is locked).
+    Nothing is decrypted."""
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        shutil.copy(db, tmp)
+        c = sqlite3.connect(tmp)
+        n = c.execute("select count(*) from cookies where host_key like '%claude.ai' and name='sessionKey'").fetchone()[0]
+        c.close()
+        return n > 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def main_profile_cookies(account):
+    src = main_chrome_profile_for(account)
+    if not src:
+        return src, None
+    db = None
+    for cand in (os.path.join(MAIN_CHROME, src, "Cookies"), os.path.join(MAIN_CHROME, src, "Network", "Cookies")):
+        if os.path.exists(cand):
+            db = cand
+    return src, db
+
+
+def main_profile_has_session(account):
+    src, db = main_profile_cookies(account)
+    if not src:
+        return None
+    return bool(db and _db_has_claude_session(db))
+
+
+# ------------------------------------------------------------------- origin
+
+def caller_identity(origin=None):
+    """Where the launching agent lives, so a human can find it. Order: --origin,
+    config `origin_command`, a herdr pane, a tmux pane, else the tty ("bare").
+    Read from the agent's own environment only: asking a multiplexer for its
+    *current* pane from outside returns the focused pane, i.e. someone else's."""
+    ident = {"host": os.uname().nodename.split(".")[0], "kind": "bare",
+             "pane": None, "tab": None, "workspace": None, "target": None}
+    env = os.environ
+    if not origin and CFG.get("origin_command"):
+        r = subprocess.run(CFG["origin_command"], shell=True, capture_output=True, text=True)  # nosec B602
+        if r.returncode == 0 and r.stdout.strip():
+            origin = r.stdout.strip().splitlines()[0]
+    if origin:
+        ident.update(kind="custom", pane=origin.strip()[:64])
+    elif env.get("HERDR_ENV") == "1" and env.get("HERDR_PANE_ID"):
+        ident.update(kind="herdr", pane=env.get("HERDR_PANE_ID"),
+                     tab=env.get("HERDR_TAB_ID"), workspace=env.get("HERDR_WORKSPACE_ID"))
+        if shutil.which("herdr"):
+            r = subprocess.run(["herdr", "pane", "get", ident["pane"]], capture_output=True, text=True)
+            try:
+                pane = json.loads(r.stdout)["result"]["pane"]
+                ident["tab"] = pane.get("tab_id") or ident["tab"]
+                ident["workspace"] = pane.get("workspace_id") or ident["workspace"]
+                ident["title"] = pane.get("title")
+            except Exception:
+                pass
+        ident["target"] = f"herdr pane read {ident['pane']}"
+    elif env.get("TMUX") and env.get("TMUX_PANE"):
+        ident.update(kind="tmux", pane=env["TMUX_PANE"])
+        r = subprocess.run(["tmux", "display", "-p", "-t", env["TMUX_PANE"], "#S:#I.#P #W"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            loc, _, win = r.stdout.strip().partition(" ")
+            ident.update(tab=win, workspace=loc.split(":")[0], tmux_target=loc)
+        ident["target"] = f"tmux capture-pane -p -t {ident.get('tmux_target') or ident['pane']}"
+    else:
+        try:
+            ident["pane"] = os.ttyname(0)
+        except OSError:
+            pass
+    return ident
+
+
+# -------------------------------------------------------------- icons, apps
+
+def app_version(path):
+    try:
+        import plistlib
+        with open(os.path.join(path, "Contents", "Info.plist"), "rb") as fh:
+            return plistlib.load(fh).get("CFBundleShortVersionString")
+    except Exception:
+        return None
+
+
+def app_copy_path(account=None):
+    """<apps_dir>/Chrome Claude <n>.app for an account, else the generic copy."""
+    if account:
+        p = os.path.join(APPS_DIR, f"Chrome Claude {account_suffix(account)}.app")
+        if os.path.isdir(p):
+            return p
+    return CHROME_APP_COPY
+
+
+def chrome_app_for_launch(account=None):
+    """Prefer the icon-bearing copy (per-account if built) when it matches the
+    installed Chrome version; otherwise the stock app (and say so)."""
+    p = app_copy_path(account)
+    if os.path.isdir(p):
+        if app_version(p) == app_version(CHROME_APP_SRC):
+            return p
+        print(f"  note: {p} is version {app_version(p)} but Chrome is {app_version(CHROME_APP_SRC)}; "
+              f"run `claude-browser app build` — launching the stock app for now")
+    return CHROME_APP
+
+
+def make_icon(out, account=None, label=None, sublabel=None):
+    """Render an .icns from the installed Chrome's own icon (nothing is shipped).
+    Needs Pillow: via `uv run --with pillow` when uv is installed, else python3."""
+    runner = ["uv", "run", "--quiet", "--with", "pillow"] if shutil.which("uv") else ["python3"]
+    cmd = runner + [ICON_MAKER, out, "--base", os.path.join(CHROME_APP_SRC, "Contents", "Resources", "app.icns")]
+    if account:
+        cmd += ["--account", account, "--badge", account_badge(account)]
+    if label:
+        cmd += [f"--label={label}"]
+    if sublabel:
+        cmd += [f"--sublabel={sublabel}"]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0 and os.path.isfile(out), (r.stderr or r.stdout).strip()
+
+
+def build_instance_app(user_data_dir, account, purpose, identity, session):
+    """One app copy per instance so the Dock shows WHAT it does and WHERE it is
+    driven from: icon = account disc + purpose plate + origin line; app name =
+    '<badge> <purpose> <origin> <session8>' (Dock hover). APFS clone of Google
+    Chrome (instant, copy-on-write); removed at teardown. Falls back to the
+    per-account copy if the icon cannot be rendered."""
+    if not shutil.which("fileicon"):
+        return None
+    pane = (identity or {}).get("pane") or ""
+    kind = (identity or {}).get("kind") or "bare"
+    where = ((identity or {}).get("tmux_target") or pane) if kind in ("herdr", "tmux", "custom") and pane else "bare"
+    safe = lambda t: re.sub(r"[^A-Za-z0-9:_.-]+", "-", t)
+    path = os.path.join(INSTANCE_APPS, f"{account_badge(account)} {safe(purpose)} {safe(where)} {session[:8]}.app")
+    os.makedirs(INSTANCE_APPS, exist_ok=True)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    r = subprocess.run(["cp", "-Rc", CHROME_APP_SRC, path], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    icon = os.path.join(user_data_dir, "instance-icon.icns")
+    ok, _ = make_icon(icon, account=account, label=purpose, sublabel=where)
+    if not ok:
+        shutil.rmtree(path, ignore_errors=True)
+        return None
+    subprocess.run(["fileicon", "set", path, icon], capture_output=True)
+    return path
+
+
+def launch(user_data_dir, urls=(), account=None, app=None):
+    args = ["open", "-na", app or chrome_app_for_launch(account), "--args",
+            f"--user-data-dir={user_data_dir}",
+            "--profile-directory=Default",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-session-crashed-bubble", "--hide-crash-restore-bubble"]
+    if urls is not None:
+        args += list(urls) or ["about:blank"]
+    subprocess.run(args, check=False)
+
+
+def set_profile_name(user_data_dir, name):
+    """Chrome shows profile.name in the window's avatar button and tab strip.
+    profile.name is in Preferences (not Secure Preferences), so editing it
+    before launch does not trip the settings-reset HMAC."""
+    pref = os.path.join(user_data_dir, "Default", "Preferences")
+    p = read_json(pref, {}) or {}
+    p.setdefault("profile", {})["name"] = name
+    p["profile"]["using_default_name"] = False
+    write_json(pref, p)
+
+
+def wait_for_device_id(user_data_dir, timeout=25):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        d = device_id(user_data_dir)
+        if d:
+            return d
+        time.sleep(1)
+    return None
+
+
+# --------------------------------------------------------------- templates
+
+def cmd_template_init():
+    """Create the shared BASE: a fresh Chrome profile with the Claude extension
+    installed and nothing else. One human step, once per Mac: Add to Chrome."""
+    if os.path.isdir(os.path.join(BASE, "Default")) and extension_installed(BASE, EXT_CLAUDE):
+        print(f"base already exists with the extension: {BASE}")
+        return 0
+    os.makedirs(os.path.join(BASE, "Default"), exist_ok=True)
+    write_json(os.path.join(BASE, "template.json"), {
+        "kind": "base", "created": time.strftime("%Y-%m-%d %H:%M:%S"), "extensions": [EXT_CLAUDE]})
+    ensure_native_hosts(BASE)
+    set_profile_name(BASE, "claude-browser base")
+    launch(BASE, [f"https://chromewebstore.google.com/detail/{EXT_CLAUDE}"])
+    print(f"""Opened a fresh Chrome instance on {BASE}
+
+HUMAN STEPS (once per Mac):
+  1. Add to Chrome — Claude in Chrome. Do NOT sign in to anything.
+  2. Install nothing else. Quit this Chrome instance (Cmd-Q in that window).
+Then:  claude-browser template pair <account>   for each account.""")
+    return 0
+
+
+def base_status():
+    st = {"dir": BASE, "exists": os.path.isdir(os.path.join(BASE, "Default"))}
+    if not st["exists"]:
+        return st
+    st["claude_extension"] = extension_installed(BASE, EXT_CLAUDE)
+    st["open"] = is_open(BASE)
+    extdir = os.path.join(BASE, "Default", "Extensions")
+    st["extension_count"] = len([e for e in os.listdir(extdir) if not e.startswith(".")]) if os.path.isdir(extdir) else 0
+    st["stray_pairing"] = device_id(BASE)   # must be None: identity never lives in the base
+    st["ready"] = bool(st["claude_extension"] and not st["open"])
+    return st
+
+
+def template_status(account):
+    """An account is ready when the shared base is ready and the account has a
+    pairing overlay with a device id. Its claude.ai session comes from the
+    account's main-Chrome profile at every launch (informational here)."""
+    bs = base_status()
+    d = tdir(account)
+    st = {"account": account, "dir": d, "exists": os.path.isdir(overlay_store(account)), "base": bs}
+    st["device_id"] = device_id_in_store(overlay_store(account)) if st["exists"] else None
+    st["claude_session"] = main_profile_has_session(account)
+    st["claude_extension"] = bs.get("claude_extension", False)
+    st["open"] = bs.get("open", False)
+    meta = read_json(os.path.join(d, "overlay.json"), {}) or {}
+    st["paired"] = meta.get("paired")
+    st["ready"] = bool(bs.get("ready") and st["device_id"])
+    return st
+
+
+def cmd_template_check(account):
+    st = template_status(account)
+    bs = st["base"]
+    if not bs.get("exists"):
+        die("no base template: run  claude-browser template init", 2)
+    for k in ("claude_extension", "open", "extension_count", "stray_pairing"):
+        print(f"  base {k:20} {bs.get(k)}")
+    for k in ("exists", "device_id", "paired", "claude_session"):
+        print(f"  {account} {k:17} {st.get(k)}")
+    if st["ready"]:
+        if st["claude_session"] is None:
+            print(f"  note: no main-Chrome profile is mapped to {account} (config `accounts`); "
+                  f"clones will not be signed in to claude.ai")
+        elif st["claude_session"] is False:
+            print(f"  note: {main_chrome_profile_for(account)} in main Chrome has no claude.ai session; "
+                  f"the clone will not be signed in until you sign in there")
+        print(f"READY: {account} can be cloned (base + overlay)")
+        return 0
+    why = []
+    if not bs.get("claude_extension"):
+        why.append("Claude in Chrome extension not installed in the base (claude-browser template init)")
+    if bs.get("open"):
+        why.append("base is open in Chrome (quit that instance)")
+    if not st["device_id"]:
+        why.append(f"no pairing overlay for {account} (claude-browser template pair {account})")
+    die("NOT READY: " + "; ".join(why), 2)
+
+
+def quit_instance(user_data_dir, timeout=15):
+    if not chrome_pids(user_data_dir):
+        return True
+    kill_instance(user_data_dir)
+    for _ in range(timeout * 2):
+        if not chrome_pids(user_data_dir) and not is_open(user_data_dir):
+            return True
+        time.sleep(0.5)
+    return not chrome_pids(user_data_dir)
+
+
+def cmd_template_list():
+    bs = base_status()
+    if not bs.get("exists"):
+        print("no base template (claude-browser template init)")
+        return 0
+    print(f"base       ext={bs.get('claude_extension')} open={bs.get('open')} extensions={bs.get('extension_count')} "
+          f"stray_pairing={bs.get('stray_pairing')}  {BASE}")
+    for a in known_accounts():
+        st = template_status(a)
+        print(f"{a:10} ready={st.get('ready')}  device={st.get('device_id')}  paired={st.get('paired')}  "
+              f"main_profile={main_chrome_profile_for(a)} session={st.get('claude_session')}")
+    return 0
+
+
+def save_overlay(account, src_store, how):
+    dst = overlay_store(account)
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src_store, dst)
+    dev = device_id_in_store(dst)
+    write_json(os.path.join(tdir(account), "overlay.json"), {
+        "account": account, "device_id": dev, "paired": how,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+    return dev
+
+
+def cmd_template_pair(account, wait=600):
+    """Add an account: clone the base WITHOUT any pairing, give it this
+    account's claude.ai session from the main Chrome, open it, and wait for the
+    human to click the extension once. The resulting local storage (device id
+    + auth hand-off) is saved as the account's overlay."""
+    bs = base_status()
+    if not bs.get("ready"):
+        die("base not ready (claude-browser template check <account>)", 2)
+    src = main_chrome_profile_for(account)
+    if not src:
+        die(f"no main-Chrome profile mapped to {account}: add it to config `accounts` "
+            f"(e.g. \"{account}\": \"Profile 3\"), see `claude-browser config`", 2)
+    if main_profile_has_session(account) is not True:
+        die(f"{src} in main Chrome has no claude.ai session for {account}; sign in to claude.ai there first", 2)
+    session = f"pair-{account.lower()}"
+    dst = sdir(session)
+    if os.path.isdir(dst) and chrome_pids(dst):
+        print(f"  resuming: the {account} pairing window is still open; waiting for the click again")
+        log_event("pair-resume", session=session, account=account)
+    else:
+        if os.path.isdir(dst):
+            teardown(session, by="pair-restart")
+        dst = clone_template(account, session, with_overlay=False)
+        reset_device_id(dst)
+        print(f"  identity: {refresh_claude_identity(dst, account)}")
+        set_profile_name(dst, f"{account} · pair")
+        identity = caller_identity()
+        app = build_instance_app(dst, account, "pair", identity, session)
+        meta = {"session": session, "account": account, "app": app, "purpose": "pair", "sites": [],
+                "identity": identity, "name": f"{account} · pair", "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+        write_json(os.path.join(dst, "instance.json"), meta)
+        card = write_instance_card(dst, meta)
+        clean_start(dst)
+        launch(dst, ["file://" + card, "https://claude.ai/"], account=account, app=app)
+        log_event("pair-start", session=session, account=account)
+    print(f"""
+HUMAN STEP ({account}): in the new window (icon badge {account_badge(account)}), click the Claude
+extension icon in the toolbar and authorize it for {account}. Waiting up to {wait}s…""")
+    t0 = time.time()
+    dev = wait_for_device_id(dst, timeout=wait)
+    if not dev:
+        log_event("pair-timeout", session=session, account=account, waited_s=round(time.time() - t0))
+        print(f"  no device id after {wait}s — instance left open: claude-browser down {session}")
+        return 3
+    time.sleep(5)   # let the extension flush its storage
+    quit_instance(dst)
+    saved = save_overlay(account, ext_settings(dst), how=f"human click {time.strftime('%Y-%m-%d %H:%M')}")
+    teardown(session, by="pair-done")
+    log_event("paired", session=session, account=account, device_id=saved, waited_s=round(time.time() - t0))
+    print(f"PAIRED {account}: device id {saved} saved to {tdir(account)} ({round(time.time() - t0)}s)")
+    return 0
+
+
+# --------------------------------------------------------------- instances
+
+def ensure_native_hosts(user_data_dir):
+    """Chrome resolves user-level native messaging host manifests under the
+    USER DATA DIR, so a --user-data-dir instance cannot see the main Chrome's
+    NativeMessagingHosts directory. A symlink exposes it and stays current as
+    hosts are added. (Copies launched from a relocated app bundle still do not
+    find them; see README "Known limits".)"""
+    link = os.path.join(user_data_dir, "NativeMessagingHosts")
+    if not os.path.lexists(link) and os.path.isdir(NMH_MAIN):
+        os.symlink(NMH_MAIN, link)
+
+
+def clone_template(account, session, with_overlay=True):
+    """Instance = APFS clone of the shared base + this account's pairing overlay."""
+    src, dst = BASE, sdir(session)
+    if not os.path.isdir(os.path.join(src, "Default")):
+        die("no base template (claude-browser template init)", 2)
+    ensure_native_hosts(src)
+    if os.path.exists(dst):
+        die(f"instance already exists for session {session}: {dst}\n(run  claude-browser down {session}  first)")
+    os.makedirs(SESSIONS, exist_ok=True)
+    # APFS clonefile: instant, copy-on-write.
+    r = subprocess.run(["cp", "-Rc", src, dst], capture_output=True, text=True)
+    if r.returncode != 0:
+        shutil.copytree(src, dst, symlinks=True)
+    # Never carry a lock or a running-state marker into the clone.
+    for junk in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"):
+        p = os.path.join(dst, junk)
+        if os.path.lexists(p):
+            os.unlink(p)
+    if with_overlay:
+        store = overlay_store(account)
+        if not os.path.isdir(store):
+            die(f"no pairing overlay for {account} (claude-browser template pair {account})", 2)
+        reset_device_id(dst)
+        shutil.copytree(store, ext_settings(dst))
+    return dst
+
+
+def reset_device_id(user_data_dir):
+    """Drop the Claude extension's LevelDB so it mints a fresh bridgeDeviceId."""
+    store = ext_settings(user_data_dir)
+    if os.path.isdir(store):
+        shutil.rmtree(store)
+
+
+def graft(user_data_dir, sites, dry_run=False):
+    """Copy cookies for SITES only (host glob *site per site) from the
+    site-cookie source profile. The agent declares the sites it needs;
+    nothing else leaves that profile."""
+    if not grafter_ok():
+        print(f"  graft: SKIPPED — chrome-cookie-graft not found ({GRAFTER})")
+        return False
+    if not sites:
+        print("  graft: SKIPPED — no sites declared")
+        return False
+    target = os.path.join(user_data_dir, "Default")
+    state = os.path.join(user_data_dir, "graft-state.json")
+    cmd = [GRAFTER, "--force", "--chrome-dir", MAIN_CHROME, "--source", SITE_COOKIE_SOURCE, "--state", state]
+    for site in sites:
+        cmd += ["--only", site, "--only", f"*.{site}"]
+    cmd.append(target)
+    if dry_run:
+        cmd.insert(1, "-n")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    for line in (r.stdout + r.stderr).strip().splitlines():
+        print("  graft:", line)
+    return r.returncode == 0
+
+
+PURPOSE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
+HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+# Two-label hosts that are public suffixes, not sites: grafting them would copy
+# every site under them. Not exhaustive; `allowed_sites` is the real fence.
+PUBLIC_SUFFIXES = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp",
+                   "co.nz", "co.in", "com.br", "com.cn", "com.mx", "co.za", "github.io", "herokuapp.com",
+                   "appspot.com", "blogspot.com", "cloudfront.net", "s3.amazonaws.com"}
+
+
+def _under(host, base):
+    return host == base or host.endswith("." + base)
+
+
+def check_sites(sites):
+    """A site is a dotted hostname (no globs); it covers itself and its
+    subdomains. Config `denied_sites` always wins; with `allowed_sites` set,
+    every site must fall under one of them."""
+    for h in sites:
+        if not HOST_RE.fullmatch(h) or h in PUBLIC_SUFFIXES:
+            return f"--sites {h!r} is not a hostname like example.com (no wildcards, no bare suffixes)"
+        if any(_under(h, c.lstrip("*.")) for c in CLAUDE_HOSTS + ["anthropic.com"]):
+            return (f"--sites {h!r} is a Claude/Anthropic host: the Claude identity comes only from "
+                    f"the account's own profile, and anthropic.com is never grafted")
+        if any(_under(h, d) for d in DENIED_SITES):
+            return f"--sites {h!r} is denied by config `denied_sites`"
+        if ALLOWED_SITES and not any(_under(h, a) for a in ALLOWED_SITES):
+            return f"--sites {h!r} is not in config `allowed_sites`"
+    return None
+
+
+def clean_start(user_data_dir):
+    """No inherited session in a clone (the base's last tabs), and a clean
+    exit flag. NOTE: pinned_tabs / session.restore_on_startup / startup_urls
+    are TRACKED prefs (settings-reset HMAC); Chrome discards outside writes
+    to them, and --pinned-tab-count did not pin either. Pinning is a
+    human-only action; the card tab is marked by its robot favicon and
+    "🤖 <badge> <purpose>" title and opens first instead."""
+    pref = os.path.join(user_data_dir, "Default", "Preferences")
+    p = read_json(pref, {}) or {}
+    p.setdefault("profile", {})["exit_type"] = "Normal"
+    p["profile"]["exited_cleanly"] = True
+    write_json(pref, p)
+    for d in ("Sessions", "Session Storage"):
+        shutil.rmtree(os.path.join(user_data_dir, "Default", d), ignore_errors=True)
+
+
+def write_instance_card(user_data_dir, meta):
+    """A local page opened as the instance's first tab: who drives this
+    browser, from where, and what it is for. Everything in it is also in
+    instance.json / `claude-browser list`."""
+    ident = meta.get("identity", {})
+    sid = meta["session"]
+    sites = ", ".join(meta.get("sites") or []) or "none (no graft)"
+    badge = account_badge(meta["account"])
+    rows = [
+        ("purpose", meta["purpose"]),
+        ("Claude account", f"{meta['account']} (icon badge {badge})"),
+        ("Claude session", sid),
+        ("resume", f"claude --resume {sid}"),
+        ("where it runs", f"{ident.get('kind')} on {ident.get('host')} — {ident.get('pane') or '?'}"
+                          f", tab {ident.get('tab') or '?'}, workspace {ident.get('workspace') or '?'}"),
+        ("watch it", ident.get("target") or "n/a"),
+        ("dock app", os.path.basename(meta.get("app") or "") or "per-account copy"),
+        ("sites grafted", sites),
+        ("created", meta["created"]),
+        ("tear down", f"claude-browser down {sid}"),
+    ]
+    esc = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;")
+    trs = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in rows)
+    favicon = ("data:image/svg+xml," + "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+               "%3Crect x='8' y='18' width='48' height='36' rx='8' fill='%231a73e8'/%3E"
+               "%3Crect x='18' y='30' width='10' height='10' rx='2' fill='white'/%3E"
+               "%3Crect x='36' y='30' width='10' height='10' rx='2' fill='white'/%3E"
+               "%3Crect x='24' y='46' width='16' height='4' rx='2' fill='white'/%3E"
+               "%3Crect x='30' y='6' width='4' height='12' fill='%231a73e8'/%3E"
+               "%3Ccircle cx='32' cy='6' r='4' fill='%231a73e8'/%3E%3C/svg%3E")
+    tab_title = f"🤖 {badge} {meta['purpose']}"   # pinning from outside is not possible (see clean_start)
+    html = f"""<!doctype html><meta charset=utf-8><title>{esc(tab_title)}</title>
+<link rel="icon" href="{favicon}">
+<style>body{{font:15px -apple-system,sans-serif;margin:40px;color:#222}}h1{{font-size:28px;margin:0 0 4px}}
+.sub{{color:#666;margin-bottom:24px}}table{{border-collapse:collapse}}th{{text-align:left;padding:6px 18px 6px 0;color:#555;white-space:nowrap}}
+td{{padding:6px 0;font-family:ui-monospace,Menlo,monospace}}.p{{display:inline-block;background:#1a73e8;color:#fff;border-radius:6px;padding:2px 10px}}</style>
+<h1><span class=p>{esc(meta['purpose'])}</span> {esc(meta['account'])}</h1>
+<div class=sub>Per-session browser for Claude session {esc(sid[:8])}. Not your everyday Chrome profile. It is deleted when the session ends.</div>
+<table>{trs}</table>"""
+    path = os.path.join(user_data_dir, "instance-card.html")
+    with open(path, "w") as fh:
+        fh.write(html)
+    return path
+
+
+def refresh_claude_identity(user_data_dir, account):
+    """At every launch, re-copy ONLY the claude.* identity cookies from this
+    account's own profile in the main Chrome into the clone, so the clone's
+    claude.ai session is as fresh as the one in use there. Skipped when the
+    source has no live sessionKey."""
+    src, src_db = main_profile_cookies(account)
+    if not src:
+        return "no main-Chrome profile mapped to this account (config `accounts`)"
+    if not src_db or not _db_has_claude_session(src_db):
+        return f"{src} has no claude.ai session; clone keeps none"
+    if not grafter_ok():
+        return "grafter missing"
+    cfg = {"source": src, "targets": [os.path.join(user_data_dir, "Default")],
+           "only": CLAUDE_HOSTS, "protect": ["chrome-extension://*"], "exclude": [],
+           "stale_days": 365, "keep_backups": 1, "min_interval_minutes": 0}
+    cfg_path = os.path.join(user_data_dir, "identity-graft-config.json")
+    write_json(cfg_path, cfg)
+    r = subprocess.run([GRAFTER, "-c", cfg_path, "--chrome-dir", MAIN_CHROME, "--force", "--replace-all",
+                        "--state", os.path.join(user_data_dir, "identity-state.json")],
+                       capture_output=True, text=True)
+    last = (r.stdout + r.stderr).strip().splitlines()[-1:] or ["?"]
+    return f"from {src}: {last[0].strip()}" if r.returncode == 0 else f"FAILED from {src}: {last[0].strip()}"
+
+
+def cmd_up(args):
+    account = args.account or session_account()
+    if not account:
+        die("cannot determine this session's Claude account: pass --account <name>, export "
+            "CLAUDE_BROWSER_ACCOUNT, or set config `account_detector` (see `claude-browser config`)")
+    session = args.session or os.environ.get("CLAUDE_SESSION_ID")
+    if not session:
+        die("no session id; pass --session or export CLAUDE_SESSION_ID")
+    check_name("account", account)
+    check_name("session", session)
+    st = template_status(account)
+    if not st.get("ready"):
+        die(f"template {account} is not ready (claude-browser template check {account})", 2,
+            account=account, session=session)
+
+    purpose = (args.purpose or "").strip()
+    if not PURPOSE_RE.match(purpose):
+        die("refusing to launch: --purpose <one-word> is required (letters, digits, - or _; max 24), "
+            "e.g. --purpose bank. It names what this browser is for, on the window and in `list`.",
+            account=account, session=session, purpose=purpose or None)
+    sites = [x.strip().lower() for x in (args.sites or "").split(",") if x.strip()]
+    bad = check_sites(sites)
+    if bad:
+        die(f"refusing to launch: {bad}", account=account, session=session, purpose=purpose)
+    if not args.no_graft and not sites:
+        die("refusing to launch: --sites host[,host...] is required unless --no-graft, "
+            "e.g. --sites example.com,example.net. Only cookies for those hosts are copied in.",
+            account=account, session=session, purpose=purpose)
+    name = args.name or f"{account} · {purpose} · {session[:8]}"
+    identity = caller_identity(args.origin)
+    print(f"up: account={account} purpose={purpose} session={session} "
+          f"from={identity['kind']}:{identity.get('pane') or '?'} sites={','.join(sites) or '-'}")
+    # Self-heal first: an instance whose Chrome is gone (session killed without
+    # its SessionEnd hook, Chrome crashed) is reaped here so nothing depends on
+    # someone remembering to run gc.
+    for m in instances():
+        # An instance another session is still setting up (cloned, not yet
+        # launched) has no pid yet: leave it alone unless it is 10 min old.
+        settling = not m.get("pid") and (m.get("age_hours") or 0) < 0.17
+        if not m["running"] and not settling and teardown(m["session"], by="up-reap"):
+            print(f"  reaped dead instance {m['session']}")
+    # Default is KEEP the overlay's device id: the clone takes over that
+    # account's relay registration. Two live clones of one account would fight
+    # over the same id (last writer wins), so refuse a second one.
+    # --new-device-id (storage reset → fresh id) is the multi-session design;
+    # unattended pairing of a reset clone is unreliable (README).
+    if not args.new_device_id:
+        live = [m for m in instances() if m.get("account") == account and m["running"] and m["session"] != session]
+        if live:
+            die(f"an instance for {account} is already live (session {live[0]['session']}); "
+                f"one per account with the shared device id — `claude-browser down {live[0]['session']}` first, "
+                f"or use --new-device-id (unattended pairing currently unreliable)", 1,
+                account=account, session=session, purpose=purpose, live_session=live[0]["session"])
+    dst = clone_template(account, session)
+    print(f"  cloned  {dst}")
+    old_id = device_id(dst)
+    if args.new_device_id:
+        reset_device_id(dst)
+        print(f"  device id reset (overlay had {old_id})")
+    else:
+        print(f"  keeping overlay device id {old_id} (this instance takes over the account's relay slot)")
+    set_profile_name(dst, name)
+    if not args.no_graft:
+        graft(dst, sites)
+    ident_note = refresh_claude_identity(dst, account)
+    print(f"  identity: {ident_note}")
+    meta = {"session": session, "account": account, "name": name, "purpose": purpose,
+            "sites": sites, "identity": identity,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"), "template_device_id": old_id}
+    write_json(os.path.join(dst, "instance.json"), meta)
+    app = build_instance_app(dst, account, purpose, identity, session)
+    meta["app"] = app
+    write_json(os.path.join(dst, "instance.json"), meta)
+    print(f"  dock app: {os.path.basename(app) if app else 'per-account copy (instance icon not built)'}")
+    card = write_instance_card(dst, meta)
+    clean_start(dst)
+    # Open claude.ai too: the extension re-derives its account from the
+    # claude.ai session; its relay connect retries on a timer.
+    launch(dst, ["file://" + card, "https://claude.ai/"], account=account, app=app)
+    pids = []
+    for _ in range(10):
+        pids = chrome_pids(dst)
+        if pids:
+            break
+        time.sleep(0.5)
+    if not pids:
+        die("  Chrome did not start for this instance", 3)
+    meta["pid"] = min(pids)
+    print(f"  launched pid {meta['pid']} window '{name}'")
+    t_launch = time.time()
+    log_event("up", session=session, account=account, purpose=purpose, sites=sites,
+              identity=identity, claude_identity=ident_note, new_device_id=bool(args.new_device_id), graft=not args.no_graft)
+    new_id = wait_for_device_id(dst, timeout=args.wait)
+    log_event("device-id" if new_id else "no-device-id", session=session, account=account,
+              purpose=purpose, device_id=new_id, waited_s=round(time.time() - t_launch))
+    meta["device_id"] = new_id
+    write_json(os.path.join(dst, "instance.json"), meta)
+    if not new_id:
+        print(f"  WARNING: no bridgeDeviceId after {args.wait}s — the extension may need a human click in this window")
+        return 3
+    if old_id and new_id == old_id and args.new_device_id:
+        print("  WARNING: device id did NOT change after reset — the relay will see a duplicate")
+    print(f"  device id {new_id}")
+    print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={new_id}")
+    return 0
+
+
+def instances():
+    out = []
+    if not os.path.isdir(SESSIONS):
+        return out
+    for s in sorted(os.listdir(SESSIONS)):
+        if not NAME_RE.fullmatch(s) or ".." in s or s != s.lower():
+            continue
+        d = sdir(s)
+        if not os.path.isdir(d):
+            continue
+        meta = read_json(os.path.join(d, "instance.json"), {}) or {}
+        meta.setdefault("session", s)
+        meta["dir"] = d
+        meta["running"] = bool(chrome_pids(d))
+        meta["device_id"] = device_id(d) or meta.get("device_id")
+        try:
+            # instance.json is written at launch and not touched by Chrome
+            # (which keeps rewriting files at the top of the dir).
+            ref = os.path.join(d, "instance.json")
+            meta["age_hours"] = round((time.time() - os.path.getmtime(ref if os.path.exists(ref) else d)) / 3600, 2)
+        except OSError:
+            meta["age_hours"] = None
+        out.append(meta)
+    return out
+
+
+def cmd_list(as_json=False):
+    rows = instances()
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no instances")
+        return 0
+    print(f"{'session':38} {'account':8} {'purpose':12} {'run':4} {'age h':6} {'from':22} device id")
+    for m in rows:
+        ident = m.get("identity") or {}
+        frm = f"{ident.get('kind','?')}:{ident.get('pane') or '?'}"
+        print(f"{m['session'][:38]:38} {m.get('account','?'):8} {(m.get('purpose') or '-')[:12]:12} "
+              f"{'yes' if m['running'] else 'no':4} {str(m.get('age_hours')):6} {frm[:22]:22} {m.get('device_id') or '-'}")
+    return 0
+
+
+def cmd_resolve(dev):
+    for m in instances():
+        if m.get("device_id") == dev:
+            ident = m.get("identity") or {}
+            print(f"session {m['session']} account {m.get('account')} purpose={m.get('purpose')} "
+                  f"running={m['running']} from={ident.get('kind')}:{ident.get('pane')} "
+                  f"sites={','.join(m.get('sites') or [])} watch=\"{ident.get('target')}\"")
+            return 0
+    for a in known_accounts():
+        if device_id_in_store(overlay_store(a)) == dev:
+            print(f"OVERLAY {a} (the account's saved pairing; no live instance holds it)")
+            return 0
+    return 1
+
+
+def teardown(session, by="down"):
+    d = sdir(session)
+    if not os.path.isdir(d):
+        return False
+    if not inside(d, SESSIONS):
+        # Refuse, but don't exit: gc / down --all / the up reaper call this in
+        # a loop, and one stray symlink must not stop them.
+        sys.stderr.write(f"refusing to tear down {d}: not inside {SESSIONS}\n")
+        log_event("teardown-refused", session=session, by=by, reason="outside sessions/")
+        return False
+    meta = read_json(os.path.join(d, "instance.json"), {}) or {}
+    pids = chrome_pids(d)
+    log_event("teardown", session=session, by=by, account=meta.get("account"),
+              purpose=meta.get("purpose"), was_running=bool(pids),
+              age_s=round(time.time() - os.path.getmtime(d)))
+    if pids:
+        kill_instance(d)
+        for _ in range(20):
+            if not chrome_pids(d):
+                break
+            time.sleep(0.5)
+        if chrome_pids(d):
+            kill_instance(d, 9)
+            time.sleep(1)
+    app = meta.get("app")
+    if app and os.path.isdir(app) and inside(app, INSTANCE_APPS):
+        shutil.rmtree(app, ignore_errors=True)
+    # A session clone is regenerable from the base (~180 MB each), so it is
+    # deleted outright; sending every ended session to the Trash just moves
+    # the leak there.
+    shutil.rmtree(d, ignore_errors=True)
+    return True
+
+
+def cmd_down(session, all_):
+    if all_:
+        n = sum(1 for m in instances() if teardown(m["session"]))
+        print(f"down: {n} instance(s)")
+        return 0
+    session = session or os.environ.get("CLAUDE_SESSION_ID")
+    if not session:
+        die("which session? pass <session> or export CLAUDE_SESSION_ID")
+    if teardown(session):
+        print(f"down: {session}")
+    else:
+        print(f"down: no instance for {session}")
+    return 0
+
+
+def cmd_events(since_hours, as_json):
+    if not os.path.exists(EVENTS):
+        print("no events yet")
+        return 0
+    cutoff = time.time() - since_hours * 3600 if since_hours else 0
+    for line in open(EVENTS):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if cutoff and time.mktime(time.strptime(r["ts"], "%Y-%m-%dT%H:%M:%S")) < cutoff:
+            continue
+        if as_json:
+            print(json.dumps(r, sort_keys=True))
+            continue
+        extra = {k: v for k, v in r.items() if k not in ("ts", "event", "pid", "cli_session", "identity")}
+        # Rows appended by other tools may carry whoami = "<label> : <email>  <account uuid>";
+        # the uuid reads like a session id, so keep the email only.
+        if isinstance(extra.get("whoami"), str) and ":" in extra["whoami"]:
+            extra["whoami"] = extra["whoami"].split(":", 1)[1].split()[0]
+        ident = r.get("identity") or {}
+        frm = f"{ident.get('kind')}:{ident.get('pane')}" if ident else ""
+        sess = r.get("cli_session") or "-"
+        if len(sess) == 36 and sess.count("-") == 4:
+            sess = sess[:8]          # a uuid: first 8 is how panes and cards name it
+        sess = sess[:22]
+        print(f"{r['ts']} {r['event']:13} {sess:22} {frm:16} " + " ".join(f"{k}={v}" for k, v in sorted(extra.items())))
+    return 0
+
+
+def cmd_gc(older_than):
+    n = 0
+    live_apps = {m.get("app") for m in instances() if m.get("app")}
+    if os.path.isdir(INSTANCE_APPS):
+        for a in os.listdir(INSTANCE_APPS):
+            p = os.path.join(INSTANCE_APPS, a)
+            # skip apps under 10 min old: a concurrent `up` may still be building it
+            try:
+                young = time.time() - os.path.getmtime(p) < 600
+            except OSError:
+                continue
+            if p.endswith(".app") and p not in live_apps and not young:
+                shutil.rmtree(p, ignore_errors=True)
+                print(f"gc: orphan dock app {a}")
+    for m in instances():
+        dead = not m["running"]
+        old = (m.get("age_hours") or 0) >= older_than
+        if (dead or old) and teardown(m["session"], by="gc-dead" if dead else "gc-old"):
+            n += 1
+            print(f"gc: {m['session']} ({'dead' if dead else 'old'})")
+    print(f"gc: {n} removed")
+    return 0
+
+
+def cmd_test_device_id(account):
+    """Clone, reset, launch, read id. PASS if the clone minted a NEW id."""
+    st = template_status(account)
+    if not st.get("ready"):
+        die(f"template {account} not ready", 2)
+    session = f"test-device-id-{int(time.time())}"
+    ns = argparse.Namespace(account=account, session=session, name=f"{account} · device-id test",
+                            no_graft=True, new_device_id=True, wait=300, origin=None,
+                            purpose="device-id-test", sites=None)
+    rc = cmd_up(ns)
+    meta = read_json(os.path.join(sdir(session), "instance.json"), {}) or {}
+    print()
+    print(f"overlay id  : {st.get('device_id')}")
+    print(f"clone id    : {meta.get('device_id')}")
+    if rc == 0 and meta.get("device_id") and meta["device_id"] != st.get("device_id"):
+        print("PASS — reset clone minted a new device id. In an agent on this account,")
+        print("       list_connected_browsers should now show the clone's id.")
+    else:
+        print("FAIL — see warnings above. The instance is left up for inspection.")
+    print(f"(instance left running: claude-browser down {session})")
+    return 0 if rc == 0 else 3
+
+
+# ------------------------------------------------------------------- app copy
+
+def build_one_app(path, icon):
+    if not shutil.which("fileicon"):
+        die("fileicon not installed (brew install fileicon)")
+    # Match the executable, not the bundle path: a bare bundle-path match
+    # catches unrelated processes.
+    exe = os.path.join(path, "Contents", "MacOS", "Google Chrome")
+    ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
+    if any(line.startswith(exe) for line in ps.splitlines()):
+        die(f"{path} is running; `claude-browser down --all` first", 1)
+    if os.path.isdir(path):
+        if TRASH:
+            subprocess.run([TRASH, path], check=False)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+    r = subprocess.run(["cp", "-Rc", CHROME_APP_SRC, path], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"clone failed: {r.stderr.strip()}", 3)
+    r = subprocess.run(["fileicon", "set", path, icon], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"fileicon failed: {r.stderr.strip()}", 3)
+    ok = subprocess.run(["codesign", "--verify", path], capture_output=True).returncode == 0
+    print(f"built {path} (Chrome {app_version(path)}), icon {os.path.basename(icon)}, signature valid={ok}")
+    return ok
+
+
+def icon_for(account=None, explicit=None):
+    if explicit:
+        return explicit
+    out = os.path.join(ICON_DIR, f"ClaudeChrome-{account}.icns" if account else "ClaudeChrome.icns")
+    ok, err = make_icon(out, account=account)
+    if not ok:
+        die(f"could not render {out}: {err or 'make-claude-chrome-icon failed'}\n"
+            f"(needs Pillow: install uv, or `python3 -m pip install pillow`)", 3)
+    return out
+
+
+def cmd_app_build(icon=None, account=None, all_accounts=False):
+    """(Re)create the icon-bearing Chrome copies: APFS clone of Google Chrome
+    + custom Finder icon rendered from Chrome's own. Generic copy by default;
+    --account A builds 'Chrome Claude <n>.app' with the account's badge; --all
+    builds the generic one plus every known account. Rerun after a Chrome update."""
+    if account:
+        check_name("account", account)
+    targets = []
+    if all_accounts:
+        targets.append((CHROME_APP_COPY, None))
+        targets += [(os.path.join(APPS_DIR, f"Chrome Claude {account_suffix(a)}.app"), a) for a in known_accounts()]
+    elif account:
+        targets.append((os.path.join(APPS_DIR, f"Chrome Claude {account_suffix(account)}.app"), account))
+    else:
+        targets.append((CHROME_APP_COPY, None))
+    os.makedirs(APPS_DIR, exist_ok=True)
+    ok = True
+    for path, acct in targets:
+        ok = build_one_app(path, icon_for(acct, icon)) and ok
+    return 0 if ok else 3
+
+
+def cmd_app_check():
+    apps = [CHROME_APP_COPY] + [os.path.join(APPS_DIR, f"Chrome Claude {account_suffix(a)}.app") for a in known_accounts()]
+    v2 = app_version(CHROME_APP_SRC)
+    rc = 0
+    for p in apps:
+        if not os.path.isdir(p):
+            print(f"{os.path.basename(p):26} missing")
+            continue
+        v1 = app_version(p)
+        ok = subprocess.run(["codesign", "--verify", p], capture_output=True).returncode == 0
+        state = "OK" if (v1 == v2 and ok) else "REBUILD"
+        rc = rc or (0 if state == "OK" else 1)
+        print(f"{os.path.basename(p):26} {v1} (stock {v2}) signature={ok} {state}")
+    return rc
+
+
+def cmd_config(as_json=False):
+    cfg = effective_config()
+    if as_json:
+        print(json.dumps(cfg, indent=2))
+        return 0
+    for k, v in cfg.items():
+        print(f"{k:24} {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+    acct = os.environ.get("CLAUDE_BROWSER_ACCOUNT") or session_account()
+    print(f"{'(this session account)':24} {acct or 'unknown — pass --account'}")
+    return 0
+
+
+# -------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="claude-browser", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=f"claude-browser {__version__}")
+    sub = ap.add_subparsers(dest="cmd")
+
+    t = sub.add_parser("template", help="the shared base and per-account pairing overlays")
+    ts = t.add_subparsers(dest="tcmd")
+    ts.add_parser("init", help="create the shared base (one human click: Add to Chrome)")
+    ts.add_parser("check").add_argument("account")
+    ts.add_parser("list")
+    pr = ts.add_parser("pair", help="add an account: clone base, sign in from main Chrome, human clicks the extension once; saves the overlay")
+    pr.add_argument("account")
+    pr.add_argument("--wait", type=int, default=600)
+
+    u = sub.add_parser("up", help="launch this session's browser")
+    u.add_argument("--account")
+    u.add_argument("--session")
+    u.add_argument("--name")
+    u.add_argument("--purpose", help="REQUIRED one word: what this browser is for (bank, shop, tickets…)")
+    u.add_argument("--sites", help="REQUIRED unless --no-graft: comma-separated hosts whose cookies to copy in")
+    u.add_argument("--origin", help="text naming where the driving agent runs (overrides pane detection)")
+    u.add_argument("--no-graft", action="store_true")
+    u.add_argument("--new-device-id", action="store_true")
+    u.add_argument("--wait", type=int, default=300,
+                   help="seconds to wait for the extension to mint its device id (0 = don't wait)")
+
+    d = sub.add_parser("down", help="tear down a session's browser")
+    d.add_argument("session", nargs="?")
+    d.add_argument("--all", action="store_true")
+
+    ev = sub.add_parser("events", help="print the event log (launches, refusals, pairings, teardowns)")
+    ev.add_argument("--since", help="hours back (default all)", type=float)
+    ev.add_argument("--json", action="store_true")
+
+    l = sub.add_parser("list", help="list instances")
+    l.add_argument("--json", action="store_true")
+
+    sub.add_parser("resolve", help="which session owns a device id").add_argument("device_id")
+
+    g = sub.add_parser("gc", help="remove dead or old instances")
+    g.add_argument("--older-than", type=float, default=24.0, help="hours")
+
+    c = sub.add_parser("config", help="print the effective configuration")
+    c.add_argument("--json", action="store_true")
+
+    te = sub.add_parser("test")
+    tes = te.add_subparsers(dest="test")
+    tes.add_parser("device-id").add_argument("account")
+
+    app = sub.add_parser("app", help="the icon-bearing Chrome copies agent instances launch from")
+    apps = app.add_subparsers(dest="acmd")
+    ab = apps.add_parser("build"); ab.add_argument("--icon"); ab.add_argument("--account"); ab.add_argument("--all", action="store_true")
+    apps.add_parser("check")
+
+    args = ap.parse_args()
+    if args.cmd == "app":
+        if args.acmd == "build":
+            return cmd_app_build(args.icon, args.account, args.all)
+        if args.acmd == "check":
+            return cmd_app_check()
+        app.print_help(); return 1
+    if args.cmd == "template":
+        if args.tcmd == "init":
+            return cmd_template_init()
+        if args.tcmd == "check":
+            return cmd_template_check(args.account)
+        if args.tcmd == "list":
+            return cmd_template_list()
+        if args.tcmd == "pair":
+            return cmd_template_pair(args.account, args.wait)
+        t.print_help(); return 1
+    if args.cmd == "up":
+        return cmd_up(args)
+    if args.cmd == "down":
+        return cmd_down(args.session, args.all)
+    if args.cmd == "events":
+        return cmd_events(args.since, args.json)
+    if args.cmd == "list":
+        return cmd_list(args.json)
+    if args.cmd == "resolve":
+        return cmd_resolve(args.device_id)
+    if args.cmd == "gc":
+        return cmd_gc(args.older_than)
+    if args.cmd == "config":
+        return cmd_config(args.json)
+    if args.cmd == "test":
+        if args.test == "device-id":
+            return cmd_test_device_id(args.account)
+        te.print_help(); return 1
+    ap.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
