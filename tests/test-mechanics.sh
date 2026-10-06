@@ -91,6 +91,15 @@ printf '{"root": "%s", "apps_dir": "%s", "idle_minutes": 0.5}\n' "$ROOT" "$TMPRO
 reaped=no; for i in $(seq 1 24); do "$CB" gc | grep -q "acct-$ACC (idle)" && { reaped=yes; break; }; sleep 5; done
 [ $reaped = yes ] && echo "idle browser reaped by gc: yes" || { echo "FAIL: idle not reaped"; "$CB" list; exit 1; }
 
+echo "8b. --hold: a held browser survives the idle limit"
+printf '{"root": "%s", "apps_dir": "%s"}\n' "$ROOT" "$TMPROOT/Applications" > "$CLAUDE_BROWSER_CONFIG"
+"$CB" up --account "$ACC" --session "$SESS-h1" --purpose wait --no-graft --hold 60 --wait 2 >/dev/null 2>&1 || true
+printf '{"root": "%s", "apps_dir": "%s", "idle_minutes": 0.5}\n' "$ROOT" "$TMPROOT/Applications" > "$CLAUDE_BROWSER_CONFIG"
+sleep 50
+"$CB" gc | grep -q "acct-$ACC" && { echo "FAIL: held browser reaped"; exit 1; }
+"$CB" list | grep -q "hold 5[0-9]m" && echo "held browser kept past idle, hold shown in list: yes" || { echo "FAIL: hold not shown"; "$CB" list; exit 1; }
+"$CB" down --all >/dev/null
+
 echo "9. owner-gone: a dead agent is detached; when every agent is gone the browser goes"
 printf '{"root": "%s", "apps_dir": "%s", "owner_process_names": ["fakeowner"]}\n' "$ROOT" "$TMPROOT/Applications" > "$CLAUDE_BROWSER_CONFIG"
 ln -sf /bin/bash "$TMPROOT/fakeowner"

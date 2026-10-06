@@ -61,7 +61,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -461,9 +461,20 @@ def reap_reason(m):
         return "unattached"
     if att and all(x.get("owner_pid") and x.get("owner_alive") is False for x in att):
         return "owner-gone"
-    if IDLE_MINUTES and (m.get("idle_minutes") or 0) >= IDLE_MINUTES:
+    if IDLE_MINUTES and (m.get("idle_minutes") or 0) >= IDLE_MINUTES and not held(m):
         return "idle"
     return None
+
+
+HOLD_MAX_MINUTES = 24 * 60
+
+
+def held(m):
+    """An attached agent declared a long wait (`up --hold N`, e.g. for a human
+    sign-in): the idle reaper leaves the browser alone until that time."""
+    now = time.time()
+    return any((x.get("hold_until") or 0) > now and x.get("owner_alive") is not False
+               for x in m.get("attachments") or [])
 
 
 def prune_attachments():
@@ -1185,13 +1196,19 @@ def cmd_up(args):
         # A resumed session (claude --resume) runs in a new process: record it,
         # or the reaper would take the old, dead PID as "agent gone".
         me = owner_pid()
-        if me and a.get("owner_pid") != me and m.get("attached") is not None:
+        hold = getattr(args, "hold", None)
+        if m.get("attached") is not None and ((me and a.get("owner_pid") != me) or hold):
             with slot_lock():
                 def refresh(mt):
                     for x in mt.get("attached", []):
                         if x.get("session") == session:
-                            x["owner_pid"] = me
+                            if me:
+                                x["owner_pid"] = me
+                            if hold:
+                                x["hold_until"] = time.time() + min(hold, HOLD_MAX_MINUTES) * 60
                 update_meta(m["dir"], refresh)
+            if hold:
+                print(f"  hold: the idle reaper leaves this browser alone for {min(hold, HOLD_MAX_MINUTES)} min")
         print(f"up: this session is already attached to the {m.get('account')} browser "
               f"(purpose {a.get('purpose')}), device id {m.get('device_id')}")
         print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={m.get('device_id')}")
@@ -1221,6 +1238,8 @@ def cmd_up(args):
     identity = caller_identity(args.origin)
     att = {"session": session, "purpose": purpose, "sites": sites, "identity": identity,
            "owner_pid": owner_pid(), "attached_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if args.hold:
+        att["hold_until"] = time.time() + min(args.hold, HOLD_MAX_MINUTES) * 60
     name = instance_name(account)
     print(f"up: account={account} purpose={purpose} session={session} "
           f"from={identity['kind']}:{identity.get('pane') or '?'} sites={','.join(sites) or '-'}")
@@ -1367,7 +1386,9 @@ def cmd_list(as_json=False):
         for a in att:
             ident = a.get("identity") or {}
             owner = {True: "alive", False: "GONE", None: "-"}[a.get("owner_alive")]
-            print(f"    {(a.get('session') or '?'):38} {(a.get('purpose') or '-')[:12]:12} owner {owner:5} "
+            hold = a.get("hold_until") or 0
+            hold_s = f" hold {int((hold - time.time()) / 60)}m" if hold > time.time() else ""
+            print(f"    {(a.get('session') or '?'):38} {(a.get('purpose') or '-')[:12]:12} owner {owner:5}{hold_s} "
                   f"from {ident.get('kind','?')}:{ident.get('pane') or '?'} sites {','.join(a.get('sites') or []) or '-'}")
     return 0
 
@@ -1388,6 +1409,17 @@ def cmd_resolve(dev):
     return 1
 
 
+def browser_age_s(meta, d):
+    """Seconds since launch (launched_at), else since `created`. Not the dir
+    mtime: atomic instance.json writes touch the directory on every attach."""
+    if meta.get("launched_at"):
+        return round(time.time() - meta["launched_at"])
+    try:
+        return round(time.time() - time.mktime(time.strptime(meta["created"], "%Y-%m-%d %H:%M:%S")))
+    except (KeyError, ValueError, TypeError):
+        return round(time.time() - os.path.getmtime(d))
+
+
 def teardown(session, by="down"):
     d = sdir(session)
     if not os.path.isdir(d):
@@ -1402,7 +1434,7 @@ def teardown(session, by="down"):
     pids = chrome_pids(d)
     log_event("teardown", session=session, by=by, account=meta.get("account"),
               purpose=meta.get("purpose"), was_running=bool(pids),
-              age_s=round(time.time() - os.path.getmtime(d)))
+              age_s=browser_age_s(meta, d))
     if pids:
         kill_instance(d)
         for _ in range(20):
@@ -1505,7 +1537,7 @@ def cmd_gc(older_than):
     with slot_lock():
         prune_attachments()
         for m in instances():
-            alive = any(x.get("owner_alive") for x in m.get("attachments") or [])
+            alive = any(x.get("owner_alive") for x in m.get("attachments") or []) or held(m)
             why = reap_reason(m) or ("old" if (m.get("age_hours") or 0) >= older_than and not alive else None)
             if why and teardown(m["session"], by=f"gc-{why}"):
                 n += 1
@@ -1624,6 +1656,9 @@ def main():
     u.add_argument("--purpose", help="REQUIRED one word: what this browser is for (bank, shop, tickets…)")
     u.add_argument("--sites", help="REQUIRED unless --no-graft: comma-separated hosts whose cookies to copy in")
     u.add_argument("--origin", help="text naming where the driving agent runs (overrides pane detection)")
+    u.add_argument("--hold", type=int, metavar="MINUTES",
+                   help="keep the browser past the idle limit for this long (waiting on a human, max 1440); "
+                        "re-run `up --hold N` in the same session to extend")
     u.add_argument("--no-graft", action="store_true")
     u.add_argument("--wait", type=int, default=300,
                    help="seconds to wait for the extension to mint its device id (0 = don't wait)")

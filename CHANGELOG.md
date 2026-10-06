@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 — 2026-10-06
+
+- `up --hold <minutes>`: an agent waiting on a human (a sign-in, an approval) keeps the shared browser past the idle limit for that long (max 24 h). Re-run in the same session to extend. `list` shows the remaining hold.
+- The teardown event's `age_s` is measured from launch, not from the directory's mtime (which every attach refreshes).
+
 ## 0.2.1 — 2026-10-06
 
 - `up` tells the launching agent and every agent that attaches within the first 4 minutes that the browser is not on the relay yet: poll `list_connected_browsers` before deciding it is blocked (in a 4-agent run, 3 agents gave up on "No connected browser has deviceId" seconds after launch).
