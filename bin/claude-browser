@@ -19,31 +19,33 @@ purpose. At session end the instance is deleted.
 
 Layout (under the root, default ~/Library/Application Support/Chrome-Claude/):
   templates/_base/                shared parent: Chrome skeleton + Claude extension, NO identity
-  templates/<account>/            overlay: the account's pairing (extension local storage) + overlay.json
-  sessions/<session-id>/          per-session instance = clone of _base + overlay + copied cookies
-  sessions/<session-id>/instance.json, instance-card.html
+  templates/<account>/            the account's pairing (extension local storage) + overlay.json
+  sessions/acct-<account>/        the account's shared agent browser = clone of _base + pairing + cookies;
+                                  instance.json lists the attached agent sessions
   icons/                          generated Dock icons (from your installed Chrome's icon)
-  events.log                      append-only record of refusals, launches, pairings, teardowns
+  events.log                      append-only record of refusals, launches, attaches, detaches, teardowns
 Config: ~/.config/claude-browser/config.json (or $CLAUDE_BROWSER_CONFIG); see `claude-browser config`.
+
+One browser per Claude account, shared by every agent on that account; each
+agent works in its own tab group. The last agent to detach (or the reaper:
+Chrome gone, every agent's process gone, or idle) tears it down.
 
 Subcommands
   template init               create the base; one human click, once per Mac (Add to Chrome)
-  template pair <account>     add an account: base clone signed in from the account's main-Chrome
-                              profile; a human clicks the extension once; pairing saved as overlay
-  template check <account>    base + overlay ready?
+  template pair <account>     pair an account: base clone signed in from the account's main-Chrome
+                              profile; a human clicks the extension once; pairing saved
+  template check <account>    base + pairing ready?
   template list
-  up --purpose W --sites H[,H] [--account A] [--session S] [--origin T] [--no-graft] [--new-device-id]
-                              clone base + overlay, copy ONLY those hosts' cookies from the site-cookie
-                              source profile, refresh claude.* from the account's main-Chrome profile,
-                              launch, wait for the relay registration, print the device id.
-  down [<session>] [--all]    kill that instance's Chrome and delete its dir
-  list [--json]               instances: session, account, purpose, running, origin, device id
-  resolve <device-id>         which session/account/purpose owns this device id
+  up --purpose W --sites H[,H] [--account A] [--session S] [--origin T] [--no-graft]
+                              attach this session to its account's browser, launching it (with ONLY
+                              those hosts' cookies + claude.* from the account's profile) if needed
+  down [<session>] [--all]    detach a session; the last one out tears the browser down
+  list [--json]               browsers and their attached agents (purpose, owner alive, origin)
+  resolve <device-id>         which browser/agents own this device id
   events [--since H] [--json] the event log
-  gc [--older-than HOURS]     tear down instances that are dead or old
+  gc [--older-than HOURS]     tear down browsers that are dead, abandoned, idle or old
   app build|check             icon-bearing Chrome copies used for agent instances
   config                      print the effective configuration
-  test device-id <account>    does a reset clone pair unattended?
 
 Exit codes: 0 ok · 1 usage/precondition · 2 template not ready (human step) ·
 3 instance failed to come up.
@@ -59,7 +61,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -129,6 +131,8 @@ def effective_config():
         "chrome_app_src": CHROME_APP_SRC,
         "apps_dir": APPS_DIR,
         "native_messaging_hosts": NMH_MAIN,
+        "idle_minutes": IDLE_MINUTES,
+        "owner_process_names": sorted(OWNER_NAMES),
         "grafter": GRAFTER,
         "claude_hosts": CLAUDE_HOSTS,
         "allowed_sites": ALLOWED_SITES or None,
@@ -275,10 +279,13 @@ def read_json(path, default=None):
 
 
 def write_json(path, obj):
+    """Atomic: readers outside the lock never see a half-written file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as fh:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
         json.dump(obj, fh, indent=2, sort_keys=True)
         fh.write("\n")
+    os.replace(tmp, path)
 
 
 def grafter_ok():
@@ -338,9 +345,168 @@ def device_id(user_data_dir):
     return device_id_in_store(ext_settings(user_data_dir))
 
 
-def overlay_store(account):
-    """Where an account's pairing (the extension's local storage) is kept."""
-    return os.path.join(tdir(account), "Local Extension Settings", EXT_CLAUDE)
+# An account's saved pairing (the extension's local storage after one human
+# click) is slot 1 at templates/<account>/. The shared per-account browser uses
+# slot 1. The slot helpers also read templates/<account>/slots/<n>/ for n > 1;
+# nothing in 0.2.0 creates those.
+def slot_root(account, n):
+    return tdir(account) if int(n) == 1 else os.path.join(tdir(account), "slots", str(int(n)))
+
+
+def slot_store(account, n):
+    return os.path.join(slot_root(account, n), "Local Extension Settings", EXT_CLAUDE)
+
+
+def slot_meta_path(account, n):
+    return os.path.join(slot_root(account, n), "overlay.json")
+
+
+def account_slots(account):
+    """{slot number: device id} for every paired slot of the account."""
+    nums = [1]
+    sd = os.path.join(tdir(account), "slots")
+    if os.path.isdir(sd):
+        nums += [int(n) for n in os.listdir(sd) if n.isdigit() and int(n) > 1]
+    out = {}
+    for n in sorted(set(nums)):
+        dev = device_id_in_store(slot_store(account, n))
+        if dev:
+            out[n] = dev
+    return out
+
+
+SETTLE_HOURS = 10 / 60     # a claimed-but-not-yet-launched instance holds its slot this long
+IDLE_MINUTES = float(CFG.get("idle_minutes", 120) or 0)   # 0 = never reap for idleness
+
+
+class slot_lock:
+    """Serialize slot allocation across concurrent `up` calls (flock on root)."""
+    def __enter__(self):
+        import fcntl
+        os.makedirs(ROOT, exist_ok=True)
+        self.fh = open(os.path.join(ROOT, "slots.lock"), "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+OWNER_NAMES = set(CFG.get("owner_process_names") or ["claude"])
+
+
+def owner_pid():
+    """PID of the agent process this command runs under (nearest ancestor whose
+    name is in config `owner_process_names`, default `claude`), so an instance
+    can be reaped when its session is gone."""
+    pid = os.getppid()
+    for _ in range(12):
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            return None
+        if os.path.basename(out[1].strip()) in OWNER_NAMES:
+            return pid
+        pid = int(out[0])
+        if pid <= 1:
+            return None
+    return None
+
+
+def owner_alive(pid):
+    if not pid:
+        return None
+    out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return os.path.basename(out) in OWNER_NAMES
+
+
+def last_activity(d):
+    """Newest write Chrome makes as tabs load and navigate (session files, history)."""
+    # Not Preferences: Chrome rewrites it on its own, which would hide idleness.
+    cands = [os.path.join(d, "instance.json"), os.path.join(d, "Default", "History")]
+    sess = os.path.join(d, "Default", "Sessions")
+    if os.path.isdir(sess):
+        cands += [os.path.join(sess, f) for f in os.listdir(sess)]
+    times = []
+    for c in cands:
+        try:
+            times.append(os.path.getmtime(c))
+        except OSError:
+            pass
+    return max(times) if times else None
+
+
+def attachments(meta):
+    """Sessions using an instance. Instances from 0.1.x (one per session, no
+    `attached` list) count as attached by their own session."""
+    a = meta.get("attached")
+    if a is None:
+        return [{"session": meta.get("session"), "purpose": meta.get("purpose"), "sites": meta.get("sites") or [],
+                 "identity": meta.get("identity") or {}, "owner_pid": meta.get("owner_pid")}]
+    if not isinstance(a, list):
+        return []
+    return [x for x in a if isinstance(x, dict) and isinstance(x.get("session"), str)]
+
+
+def reap_reason(m):
+    """Why an instance should go, or None. dead: Chrome gone. owner-gone:
+    every attached agent's process has exited (no SessionEnd detach).
+    unattached: no agent left. idle: no browser activity for idle_minutes."""
+    settling = not m.get("pid") and (m.get("age_hours") or 0) < SETTLE_HOURS
+    if not m["running"]:
+        return None if settling else "dead"
+    att = m.get("attachments") or []
+    if m.get("attached") is not None and not att and m.get("pid"):
+        return "unattached"
+    if att and all(x.get("owner_pid") and x.get("owner_alive") is False for x in att):
+        return "owner-gone"
+    if IDLE_MINUTES and (m.get("idle_minutes") or 0) >= IDLE_MINUTES:
+        return "idle"
+    return None
+
+
+def prune_attachments():
+    """Drop attachments whose agent process has exited (crashed sessions never
+    run their SessionEnd detach). Caller holds slot_lock."""
+    for m in instances():
+        if m.get("attached") is None:
+            continue
+        gone = [x for x in m["attachments"] if x.get("owner_pid") and x.get("owner_alive") is False]
+        if gone and len(gone) < len(m["attachments"]):
+            keep = [x["session"] for x in m["attachments"] if x not in gone]
+            update_meta(m["dir"], lambda meta: meta.__setitem__(
+                "attached", [x for x in meta.get("attached", []) if x.get("session") in keep]))
+            for x in gone:
+                log_event("detach", session=x.get("session"), instance=m["session"], by="owner-gone")
+            rewrite_card(m["dir"])
+
+
+def update_meta(d, fn):
+    """Read-modify-write instance.json (caller holds slot_lock when other
+    sessions may write it too)."""
+    path = os.path.join(d, "instance.json")
+    meta = read_json(path, {}) or {}
+    fn(meta)
+    write_json(path, meta)
+    return meta
+
+
+def rewrite_card(d):
+    meta = read_json(os.path.join(d, "instance.json"), None)
+    if meta:
+        write_instance_card(d, meta)
+
+
+def reap(by):
+    n = 0
+    prune_attachments()
+    for m in instances():
+        why = reap_reason(m)
+        if why and teardown(m["session"], by=f"{by}-{why}"):
+            print(f"  reaped {m['session']} ({why})")
+            n += 1
+    return n
 
 
 def device_id_in_store(store):
@@ -598,8 +764,9 @@ def template_status(account):
     account's main-Chrome profile at every launch (informational here)."""
     bs = base_status()
     d = tdir(account)
-    st = {"account": account, "dir": d, "exists": os.path.isdir(overlay_store(account)), "base": bs}
-    st["device_id"] = device_id_in_store(overlay_store(account)) if st["exists"] else None
+    slots = account_slots(account)
+    st = {"account": account, "dir": d, "exists": bool(slots), "base": bs, "slots": slots}
+    st["device_id"] = next(iter(slots.values()), None)
     st["claude_session"] = main_profile_has_session(account)
     st["claude_extension"] = bs.get("claude_extension", False)
     st["open"] = bs.get("open", False)
@@ -616,8 +783,9 @@ def cmd_template_check(account):
         die("no base template: run  claude-browser template init", 2)
     for k in ("claude_extension", "open", "extension_count", "stray_pairing"):
         print(f"  base {k:20} {bs.get(k)}")
-    for k in ("exists", "device_id", "paired", "claude_session"):
+    for k in ("exists", "paired", "claude_session"):
         print(f"  {account} {k:17} {st.get(k)}")
+    print(f"  {account} {'slots':17} {len(st['slots'])}: " + ", ".join(f"{n}={d[:8]}" for n, d in st["slots"].items()))
     if st["ready"]:
         if st["claude_session"] is None:
             print(f"  note: no main-Chrome profile is mapped to {account} (config `accounts`); "
@@ -657,28 +825,30 @@ def cmd_template_list():
           f"stray_pairing={bs.get('stray_pairing')}  {BASE}")
     for a in known_accounts():
         st = template_status(a)
-        print(f"{a:10} ready={st.get('ready')}  device={st.get('device_id')}  paired={st.get('paired')}  "
+        slots = ",".join(f"{n}={d[:8]}" for n, d in st["slots"].items()) or "-"
+        print(f"{a:10} ready={st.get('ready')}  slots={len(st['slots'])} [{slots}]  "
               f"main_profile={main_chrome_profile_for(a)} session={st.get('claude_session')}")
     return 0
 
 
-def save_overlay(account, src_store, how):
-    dst = overlay_store(account)
+def save_overlay(account, src_store, how, slot=1):
+    dst = slot_store(account, slot)
     if os.path.isdir(dst):
         shutil.rmtree(dst)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copytree(src_store, dst)
     dev = device_id_in_store(dst)
-    write_json(os.path.join(tdir(account), "overlay.json"), {
-        "account": account, "device_id": dev, "paired": how,
+    write_json(slot_meta_path(account, slot), {
+        "account": account, "slot": slot, "device_id": dev, "paired": how,
         "created": time.strftime("%Y-%m-%d %H:%M:%S")})
     return dev
 
 
-def cmd_template_pair(account, wait=600):
-    """Add an account: clone the base WITHOUT any pairing, give it this
-    account's claude.ai session from the main Chrome, open it, and wait for the
-    human to click the extension once. The resulting local storage (device id
-    + auth hand-off) is saved as the account's overlay."""
+def cmd_template_pair(account, wait=600, slots=None):
+    """(Re)pair an account: a base clone WITHOUT pairing, signed in to claude.ai
+    from the account's main-Chrome profile. The human clicks the Claude
+    extension once; the resulting local storage (device id + auth hand-off) is
+    saved as the account's pairing (slot 1, overwritten if it exists)."""
     bs = base_status()
     if not bs.get("ready"):
         die("base not ready (claude-browser template check <account>)", 2)
@@ -688,43 +858,64 @@ def cmd_template_pair(account, wait=600):
             f"(e.g. \"{account}\": \"Profile 3\"), see `claude-browser config`", 2)
     if main_profile_has_session(account) is not True:
         die(f"{src} in main Chrome has no claude.ai session for {account}; sign in to claude.ai there first", 2)
-    session = f"pair-{account.lower()}"
-    dst = sdir(session)
-    if os.path.isdir(dst) and chrome_pids(dst):
-        print(f"  resuming: the {account} pairing window is still open; waiting for the click again")
-        log_event("pair-resume", session=session, account=account)
+    have = account_slots(account)
+    if slots:
+        missing = [n for n in range(1, int(slots) + 1) if n not in have]
     else:
-        if os.path.isdir(dst):
-            teardown(session, by="pair-restart")
-        dst = clone_template(account, session, with_overlay=False)
-        reset_device_id(dst)
-        print(f"  identity: {refresh_claude_identity(dst, account)}")
-        set_profile_name(dst, f"{account} · pair")
-        identity = caller_identity()
-        app = build_instance_app(dst, account, "pair", identity, session)
-        meta = {"session": session, "account": account, "app": app, "purpose": "pair", "sites": [],
-                "identity": identity, "name": f"{account} · pair", "created": time.strftime("%Y-%m-%d %H:%M:%S")}
-        write_json(os.path.join(dst, "instance.json"), meta)
-        card = write_instance_card(dst, meta)
-        clean_start(dst)
-        launch(dst, ["file://" + card, "https://claude.ai/"], account=account, app=app)
-        log_event("pair-start", session=session, account=account)
+        missing = [1]           # re-pair (overwrite) the pairing `up` uses
+    if not missing:
+        print(f"{account} already has {len(have)} slot(s)")
+        return 0
+    windows = {}
+    for n in missing:
+        session = f"pair-{account.lower()}-{n}"
+        dst = sdir(session)
+        if os.path.isdir(dst) and chrome_pids(dst):
+            print(f"  slot {n}: pairing window still open, waiting for the click again")
+            log_event("pair-resume", session=session, account=account, slot=n)
+        else:
+            if os.path.isdir(dst):
+                teardown(session, by="pair-restart")
+            dst = clone_template(account, session, slot=None)
+            reset_device_id(dst)
+            print(f"  slot {n} identity: {refresh_claude_identity(dst, account)}")
+            set_profile_name(dst, f"{account} · pair slot {n}")
+            identity = caller_identity()
+            app = build_instance_app(dst, account, f"pair{n}", identity, session)
+            meta = {"session": session, "account": account, "app": app, "purpose": f"pair{n}", "sites": [],
+                    "identity": identity, "name": f"{account} · pair slot {n}", "pairing_slot": n,
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+            write_json(os.path.join(dst, "instance.json"), meta)
+            card = write_instance_card(dst, meta)
+            clean_start(dst)
+            launch(dst, ["file://" + card, "https://claude.ai/"], account=account, app=app)
+            log_event("pair-start", session=session, account=account, slot=n)
+        windows[n] = (session, dst)
     print(f"""
-HUMAN STEP ({account}): in the new window (icon badge {account_badge(account)}), click the Claude
-extension icon in the toolbar and authorize it for {account}. Waiting up to {wait}s…""")
+HUMAN STEP ({account}): {len(windows)} window(s) titled "{account} · pair slot N" (icon badge
+{account_badge(account)}). In EACH one, click the Claude extension icon in the toolbar and authorize it
+for {account}. Waiting up to {wait}s…""")
     t0 = time.time()
-    dev = wait_for_device_id(dst, timeout=wait)
-    if not dev:
-        log_event("pair-timeout", session=session, account=account, waited_s=round(time.time() - t0))
-        print(f"  no device id after {wait}s — instance left open: claude-browser down {session}")
-        return 3
-    time.sleep(5)   # let the extension flush its storage
-    quit_instance(dst)
-    saved = save_overlay(account, ext_settings(dst), how=f"human click {time.strftime('%Y-%m-%d %H:%M')}")
-    teardown(session, by="pair-done")
-    log_event("paired", session=session, account=account, device_id=saved, waited_s=round(time.time() - t0))
-    print(f"PAIRED {account}: device id {saved} saved to {tdir(account)} ({round(time.time() - t0)}s)")
-    return 0
+    rc = 0
+    pending = dict(windows)
+    while pending and time.time() - t0 < wait:
+        for n, (session, dst) in list(pending.items()):
+            if device_id(dst):
+                time.sleep(5)   # let the extension flush its storage
+                quit_instance(dst)
+                saved = save_overlay(account, ext_settings(dst), slot=n,
+                                     how=f"human click {time.strftime('%Y-%m-%d %H:%M')}")
+                teardown(session, by="pair-done")
+                log_event("paired", session=session, account=account, slot=n, device_id=saved,
+                          waited_s=round(time.time() - t0))
+                print(f"PAIRED {account} slot {n}: device id {saved} ({round(time.time() - t0)}s)")
+                del pending[n]
+        time.sleep(2)
+    for n, (session, dst) in pending.items():
+        log_event("pair-timeout", session=session, account=account, slot=n, waited_s=round(time.time() - t0))
+        print(f"  slot {n}: no device id after {wait}s — window left open: claude-browser down {session}")
+        rc = 3
+    return rc
 
 
 # --------------------------------------------------------------- instances
@@ -740,8 +931,9 @@ def ensure_native_hosts(user_data_dir):
         os.symlink(NMH_MAIN, link)
 
 
-def clone_template(account, session, with_overlay=True):
-    """Instance = APFS clone of the shared base + this account's pairing overlay."""
+def clone_template(account, session, slot=None):
+    """Instance = APFS clone of the shared base + one of this account's pairing
+    slots (slot=None: no pairing, for `template pair`)."""
     src, dst = BASE, sdir(session)
     if not os.path.isdir(os.path.join(src, "Default")):
         die("no base template (claude-browser template init)", 2)
@@ -758,10 +950,10 @@ def clone_template(account, session, with_overlay=True):
         p = os.path.join(dst, junk)
         if os.path.lexists(p):
             os.unlink(p)
-    if with_overlay:
-        store = overlay_store(account)
+    if slot is not None:
+        store = slot_store(account, slot)
         if not os.path.isdir(store):
-            die(f"no pairing overlay for {account} (claude-browser template pair {account})", 2)
+            die(f"no pairing slot {slot} for {account} (claude-browser template pair {account})", 2)
         reset_device_id(dst)
         shutil.copytree(store, ext_settings(dst))
     return dst
@@ -788,7 +980,8 @@ def graft(user_data_dir, sites, dry_run=False):
     state = os.path.join(user_data_dir, "graft-state.json")
     cmd = [GRAFTER, "--force", "--chrome-dir", MAIN_CHROME, "--source", SITE_COOKIE_SOURCE, "--state", state]
     for site in sites:
-        cmd += ["--only", site, "--only", f"*.{site}"]
+        # dotted host: itself + subdomains; single-label host: exactly itself
+        cmd += ["--only", site] + (["--only", f"*.{site}"] if "." in site else ["--only", f".{site}"])
     cmd.append(target)
     if dry_run:
         cmd.insert(1, "-n")
@@ -800,6 +993,12 @@ def graft(user_data_dir, sites, dry_run=False):
 
 PURPOSE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
 HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+# Single-label names (MagicDNS / LAN hosts such as `nas`) are grafted as that
+# exact host only, never `*.<name>`, so even a mistaken `com` could not pull a
+# whole domain's cookies. Common top-level domains are still refused for clarity.
+LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+COMMON_TLDS = {"com", "net", "org", "edu", "gov", "mil", "int", "io", "ai", "co", "app", "dev", "uk", "us",
+               "de", "fr", "jp", "cn", "au", "ca", "eu", "info", "biz", "me", "tv", "xyz", "online", "site"}
 # Two-label hosts that are public suffixes, not sites: grafting them would copy
 # every site under them. Not exhaustive; `allowed_sites` is the real fence.
 PUBLIC_SUFFIXES = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp",
@@ -816,8 +1015,10 @@ def check_sites(sites):
     subdomains. Config `denied_sites` always wins; with `allowed_sites` set,
     every site must fall under one of them."""
     for h in sites:
-        if not HOST_RE.fullmatch(h) or h in PUBLIC_SUFFIXES:
-            return f"--sites {h!r} is not a hostname like example.com (no wildcards, no bare suffixes)"
+        single = bool(LABEL_RE.fullmatch(h)) and h not in COMMON_TLDS
+        if not (HOST_RE.fullmatch(h) or single) or h in PUBLIC_SUFFIXES:
+            return (f"--sites {h!r} is not a hostname like example.com or a single host name like nas "
+                    f"(no wildcards, no bare suffixes)")
         if any(_under(h, c.lstrip("*.")) for c in CLAUDE_HOSTS + ["anthropic.com"]):
             return (f"--sites {h!r} is a Claude/Anthropic host: the Claude identity comes only from "
                     f"the account's own profile, and anthropic.com is never grafted")
@@ -852,6 +1053,8 @@ def write_instance_card(user_data_dir, meta):
     sid = meta["session"]
     sites = ", ".join(meta.get("sites") or []) or "none (no graft)"
     badge = account_badge(meta["account"])
+    if meta.get("attached") is not None:
+        return write_shared_card(user_data_dir, meta, badge, sites)
     rows = [
         ("purpose", meta["purpose"]),
         ("Claude account", f"{meta['account']} (icon badge {badge})"),
@@ -889,6 +1092,31 @@ td{{padding:6px 0;font-family:ui-monospace,Menlo,monospace}}.p{{display:inline-b
     return path
 
 
+def write_shared_card(user_data_dir, meta, badge, sites):
+    """The card of an account's shared browser: which agents use it, each
+    with its purpose, origin pane and resume command. Rewritten on every
+    attach / detach (reload the tab to see the latest)."""
+    esc = lambda t: str(t).replace("&", "&amp;").replace("<", "&lt;")
+    agents = meta.get("attached") or []
+    trs = "".join(
+        f"<tr><td>{esc(a.get('purpose'))}</td><td>{esc((a.get('session') or '')[:8])}</td>"
+        f"<td>{esc((a.get('identity') or {}).get('kind'))}:{esc((a.get('identity') or {}).get('pane') or '?')}</td>"
+        f"<td>{esc(', '.join(a.get('sites') or []) or '-')}</td><td>claude --resume {esc(a.get('session'))}</td></tr>"
+        for a in agents) or "<tr><td colspan=5>no agent attached</td></tr>"
+    html = f"""<!doctype html><meta charset=utf-8><title>🤖 {esc(badge)} agents ({len(agents)})</title>
+<style>body{{font:15px -apple-system,sans-serif;margin:40px;color:#222}}h1{{font-size:28px;margin:0 0 4px}}
+.sub{{color:#666;margin-bottom:24px}}table{{border-collapse:collapse}}th,td{{text-align:left;padding:6px 18px 6px 0}}
+td{{font-family:ui-monospace,Menlo,monospace}}th{{color:#555}}</style>
+<h1>{esc(meta['account'])} — shared agent browser</h1>
+<div class=sub>One Chrome per Claude account; each agent works in its own tab group. Not your everyday Chrome
+profile. It is deleted when the last agent detaches. Sites grafted at launch: {esc(sites)}. Updated {esc(time.strftime('%H:%M:%S'))}.</div>
+<table><tr><th>purpose</th><th>session</th><th>from</th><th>sites asked</th><th>resume</th></tr>{trs}</table>"""
+    path = os.path.join(user_data_dir, "instance-card.html")
+    with open(path, "w") as fh:
+        fh.write(html)
+    return path
+
+
 def refresh_claude_identity(user_data_dir, account):
     """At every launch, re-copy ONLY the claude.* identity cookies from this
     account's own profile in the main Chrome into the clone, so the clone's
@@ -913,25 +1141,59 @@ def refresh_claude_identity(user_data_dir, account):
     return f"from {src}: {last[0].strip()}" if r.returncode == 0 else f"FAILED from {src}: {last[0].strip()}"
 
 
+def instance_name(account):
+    return "acct-" + account.lower()
+
+
+def find_attached(session):
+    for m in instances():
+        for a in m.get("attachments") or []:
+            if a.get("session") == session:
+                return m, a
+    return None, None
+
+
 def cmd_up(args):
+    """Attach this session to its account's shared browser, launching it if
+    there is none. Idempotent: a session already attached gets its browser
+    reported again, before any account detection (detection can drift
+    mid-session when the machine's default login is switched)."""
+    session = args.session or os.environ.get("CLAUDE_SESSION_ID")
+    if not session:
+        die("no session id; pass --session or export CLAUDE_SESSION_ID")
+    check_name("session", session)
+    m, a = find_attached(session)
+    if m and (m["running"] or not reap_reason(m)):
+        if args.account and args.account.lower() != (m.get("account") or "").lower():
+            die(f"this session is already attached to the {m.get('account')} browser; "
+                f"`claude-browser down` first to switch to {args.account}")
+        # A resumed session (claude --resume) runs in a new process: record it,
+        # or the reaper would take the old, dead PID as "agent gone".
+        me = owner_pid()
+        if me and a.get("owner_pid") != me and m.get("attached") is not None:
+            with slot_lock():
+                def refresh(mt):
+                    for x in mt.get("attached", []):
+                        if x.get("session") == session:
+                            x["owner_pid"] = me
+                update_meta(m["dir"], refresh)
+        print(f"up: this session is already attached to the {m.get('account')} browser "
+              f"(purpose {a.get('purpose')}), device id {m.get('device_id')}")
+        print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={m.get('device_id')}")
+        return 0
     account = args.account or session_account()
     if not account:
         die("cannot determine this session's Claude account: pass --account <name>, export "
             "CLAUDE_BROWSER_ACCOUNT, or set config `account_detector` (see `claude-browser config`)")
-    session = args.session or os.environ.get("CLAUDE_SESSION_ID")
-    if not session:
-        die("no session id; pass --session or export CLAUDE_SESSION_ID")
     check_name("account", account)
-    check_name("session", session)
     st = template_status(account)
     if not st.get("ready"):
         die(f"template {account} is not ready (claude-browser template check {account})", 2,
             account=account, session=session)
-
     purpose = (args.purpose or "").strip()
     if not PURPOSE_RE.match(purpose):
         die("refusing to launch: --purpose <one-word> is required (letters, digits, - or _; max 24), "
-            "e.g. --purpose bank. It names what this browser is for, on the window and in `list`.",
+            "e.g. --purpose bank. It names what this agent uses the browser for, in `list` and on the card.",
             account=account, session=session, purpose=purpose or None)
     sites = [x.strip().lower() for x in (args.sites or "").split(",") if x.strip()]
     bad = check_sites(sites)
@@ -941,57 +1203,67 @@ def cmd_up(args):
         die("refusing to launch: --sites host[,host...] is required unless --no-graft, "
             "e.g. --sites example.com,example.net. Only cookies for those hosts are copied in.",
             account=account, session=session, purpose=purpose)
-    name = args.name or f"{account} · {purpose} · {session[:8]}"
     identity = caller_identity(args.origin)
+    att = {"session": session, "purpose": purpose, "sites": sites, "identity": identity,
+           "owner_pid": owner_pid(), "attached_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    name = instance_name(account)
     print(f"up: account={account} purpose={purpose} session={session} "
           f"from={identity['kind']}:{identity.get('pane') or '?'} sites={','.join(sites) or '-'}")
-    # Self-heal first: an instance whose Chrome is gone (session killed without
-    # its SessionEnd hook, Chrome crashed) is reaped here so nothing depends on
-    # someone remembering to run gc.
-    for m in instances():
-        # An instance another session is still setting up (cloned, not yet
-        # launched) has no pid yet: leave it alone unless it is 10 min old.
-        settling = not m.get("pid") and (m.get("age_hours") or 0) < 0.17
-        if not m["running"] and not settling and teardown(m["session"], by="up-reap"):
-            print(f"  reaped dead instance {m['session']}")
-    # Default is KEEP the overlay's device id: the clone takes over that
-    # account's relay registration. Two live clones of one account would fight
-    # over the same id (last writer wins), so refuse a second one.
-    # --new-device-id (storage reset → fresh id) is the multi-session design;
-    # unattended pairing of a reset clone is unreliable (README).
-    if not args.new_device_id:
-        live = [m for m in instances() if m.get("account") == account and m["running"] and m["session"] != session]
+    # Under one lock: reap, then either attach to the account's live (or
+    # starting) browser, or claim its directory by writing instance.json.
+    with slot_lock():
+        reap("up-reap")
+        live = next((x for x in instances() if x["session"] == name and (x["running"] or not reap_reason(x))), None)
+        # A browser started by 0.1.x (one per session, own dir name) holds the
+        # account's device id too: adopt it as the shared browser rather than
+        # launching a second one with the same id.
+        # Only one that carries the account's saved pairing: a 0.1.x browser whose
+        # device id was reset never paired and is useless to every agent.
+        paired_id = account_slots(account).get(1)
+        live = live or next((x for x in instances() if x.get("account") == account and x["running"]
+                             and not x["session"].startswith("pair-") and x.get("attached") is None
+                             and x.get("device_id") and x.get("device_id") == paired_id), None)
         if live:
-            die(f"an instance for {account} is already live (session {live[0]['session']}); "
-                f"one per account with the shared device id — `claude-browser down {live[0]['session']}` first, "
-                f"or use --new-device-id (unattended pairing currently unreliable)", 1,
-                account=account, session=session, purpose=purpose, live_session=live[0]["session"])
-    dst = clone_template(account, session)
+            if not (live.get("device_id") or device_id(live["dir"])):
+                die(f"the {account} browser is still being set up (no device id yet); run `up` again in a minute",
+                    3, account=account, session=session, purpose=purpose)
+            def add(mt):
+                if mt.get("attached") is None:
+                    mt["attached"] = attachments(mt)
+                mt["attached"].append(att)
+            meta = update_meta(live["dir"], add)
+            rewrite_card(live["dir"])
+            covered = meta.get("sites") or []
+            missing = [h for h in sites if not any((_under(h, c) if "." in c else h == c) for c in covered)]
+            dev = live.get("device_id") or device_id(live["dir"])
+            log_event("attach", session=session, account=account, purpose=purpose, sites=sites,
+                      instance=name, missing_sites=missing, identity=identity)
+            print(f"  attached to the running {account} browser ({len(meta['attached'])} agent(s)); "
+                  f"open your own tabs, close them when done")
+            if missing:
+                print(f"  NOTE: cookies for {', '.join(missing)} were not grafted (Chrome cannot take new cookies "
+                      f"while running). Log in to those sites in this window if needed; the login stays for "
+                      f"this browser's lifetime.")
+            print(f"  device id {dev}")
+            print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={dev}")
+            return 0
+        dst = clone_template(account, name, slot=1)
+        write_json(os.path.join(dst, "instance.json"), {"session": name, "account": account, "slot": 1,
+                   "purpose": "agents", "sites": sites, "attached": [att],
+                   "created": time.strftime("%Y-%m-%d %H:%M:%S")})
     print(f"  cloned  {dst}")
-    old_id = device_id(dst)
-    if args.new_device_id:
-        reset_device_id(dst)
-        print(f"  device id reset (overlay had {old_id})")
-    else:
-        print(f"  keeping overlay device id {old_id} (this instance takes over the account's relay slot)")
-    set_profile_name(dst, name)
+    set_profile_name(dst, f"{account} · agents")
     if not args.no_graft:
         graft(dst, sites)
     ident_note = refresh_claude_identity(dst, account)
     print(f"  identity: {ident_note}")
-    meta = {"session": session, "account": account, "name": name, "purpose": purpose,
-            "sites": sites, "identity": identity,
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"), "template_device_id": old_id}
-    write_json(os.path.join(dst, "instance.json"), meta)
-    app = build_instance_app(dst, account, purpose, identity, session)
-    meta["app"] = app
-    write_json(os.path.join(dst, "instance.json"), meta)
+    app = build_instance_app(dst, account, "agents", {"kind": "custom", "pane": account}, name)
+    with slot_lock():
+        update_meta(dst, lambda mt: mt.update(app=app, identity=identity, name=f"{account} · agents"))
     print(f"  dock app: {os.path.basename(app) if app else 'per-account copy (instance icon not built)'}")
-    card = write_instance_card(dst, meta)
+    rewrite_card(dst)
     clean_start(dst)
-    # Open claude.ai too: the extension re-derives its account from the
-    # claude.ai session; its relay connect retries on a timer.
-    launch(dst, ["file://" + card, "https://claude.ai/"], account=account, app=app)
+    launch(dst, ["file://" + os.path.join(dst, "instance-card.html"), "https://claude.ai/"], account=account, app=app)
     pids = []
     for _ in range(10):
         pids = chrome_pids(dst)
@@ -1000,21 +1272,20 @@ def cmd_up(args):
         time.sleep(0.5)
     if not pids:
         die("  Chrome did not start for this instance", 3)
-    meta["pid"] = min(pids)
-    print(f"  launched pid {meta['pid']} window '{name}'")
+    with slot_lock():
+        update_meta(dst, lambda mt: mt.update(pid=min(pids)))
+    print(f"  launched pid {min(pids)} window '{account} · agents'")
     t_launch = time.time()
-    log_event("up", session=session, account=account, purpose=purpose, sites=sites,
-              identity=identity, claude_identity=ident_note, new_device_id=bool(args.new_device_id), graft=not args.no_graft)
+    log_event("up", session=session, account=account, purpose=purpose, sites=sites, instance=name,
+              identity=identity, claude_identity=ident_note, graft=not args.no_graft)
     new_id = wait_for_device_id(dst, timeout=args.wait)
     log_event("device-id" if new_id else "no-device-id", session=session, account=account,
               purpose=purpose, device_id=new_id, waited_s=round(time.time() - t_launch))
-    meta["device_id"] = new_id
-    write_json(os.path.join(dst, "instance.json"), meta)
+    with slot_lock():
+        update_meta(dst, lambda mt: mt.update(device_id=new_id))
     if not new_id:
         print(f"  WARNING: no bridgeDeviceId after {args.wait}s — the extension may need a human click in this window")
         return 3
-    if old_id and new_id == old_id and args.new_device_id:
-        print("  WARNING: device id did NOT change after reset — the relay will see a duplicate")
     print(f"  device id {new_id}")
     print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={new_id}")
     return 0
@@ -1031,10 +1302,25 @@ def instances():
         if not os.path.isdir(d):
             continue
         meta = read_json(os.path.join(d, "instance.json"), {}) or {}
-        meta.setdefault("session", s)
+        meta["session"] = s       # the directory name, never a value from inside the file
         meta["dir"] = d
         meta["running"] = bool(chrome_pids(d))
+        # An instance that was launched (has a pid) but whose Chrome is gone,
+        # without a teardown: record it once, so a crash or an outside kill is
+        # visible in the event log instead of silent.
+        marker = os.path.join(d, "exited.logged")
+        if not meta["running"] and meta.get("pid") and not os.path.exists(marker):
+            log_event("chrome-exited", session=s, account=meta.get("account"), purpose=meta.get("purpose"),
+                      pid=meta.get("pid"))
+            try:
+                open(marker, "w").close()
+            except OSError:
+                pass
         meta["device_id"] = device_id(d) or meta.get("device_id")
+        meta["owner_alive"] = owner_alive(meta.get("owner_pid"))
+        meta["attachments"] = [dict(x, owner_alive=owner_alive(x.get("owner_pid"))) for x in attachments(meta)]
+        la = last_activity(d)
+        meta["idle_minutes"] = round((time.time() - la) / 60) if la else None
         try:
             # instance.json is written at launch and not touched by Chrome
             # (which keeps rewriting files at the top of the dir).
@@ -1054,27 +1340,32 @@ def cmd_list(as_json=False):
     if not rows:
         print("no instances")
         return 0
-    print(f"{'session':38} {'account':8} {'purpose':12} {'run':4} {'age h':6} {'from':22} device id")
+    print(f"{'browser':26} {'account':8} {'run':4} {'idle m':6} {'device id':38} agents")
     for m in rows:
-        ident = m.get("identity") or {}
-        frm = f"{ident.get('kind','?')}:{ident.get('pane') or '?'}"
-        print(f"{m['session'][:38]:38} {m.get('account','?'):8} {(m.get('purpose') or '-')[:12]:12} "
-              f"{'yes' if m['running'] else 'no':4} {str(m.get('age_hours')):6} {frm[:22]:22} {m.get('device_id') or '-'}")
+        att = m.get("attachments") or []
+        print(f"{m['session'][:26]:26} {m.get('account','?'):8} {'yes' if m['running'] else 'no':4} "
+              f"{str(m.get('idle_minutes')):6} {(m.get('device_id') or '-'):38} {len(att)}")
+        for a in att:
+            ident = a.get("identity") or {}
+            owner = {True: "alive", False: "GONE", None: "-"}[a.get("owner_alive")]
+            print(f"    {(a.get('session') or '?'):38} {(a.get('purpose') or '-')[:12]:12} owner {owner:5} "
+                  f"from {ident.get('kind','?')}:{ident.get('pane') or '?'} sites {','.join(a.get('sites') or []) or '-'}")
     return 0
 
 
 def cmd_resolve(dev):
     for m in instances():
         if m.get("device_id") == dev:
-            ident = m.get("identity") or {}
-            print(f"session {m['session']} account {m.get('account')} purpose={m.get('purpose')} "
-                  f"running={m['running']} from={ident.get('kind')}:{ident.get('pane')} "
-                  f"sites={','.join(m.get('sites') or [])} watch=\"{ident.get('target')}\"")
+            print(f"browser {m['session']} account {m.get('account')} running={m['running']} "
+                  f"agents: " + ", ".join(f"{(a.get('session') or '?')[:8]} ({a.get('purpose')}, "
+                                          f"{(a.get('identity') or {}).get('kind')}:{(a.get('identity') or {}).get('pane')})"
+                                          for a in m.get("attachments") or []))
             return 0
     for a in known_accounts():
-        if device_id_in_store(overlay_store(a)) == dev:
-            print(f"OVERLAY {a} (the account's saved pairing; no live instance holds it)")
-            return 0
+        for n, d in account_slots(a).items():
+            if d == dev:
+                print(f"PAIRING {a} (saved pairing; no live browser holds it right now)")
+                return 0
     return 1
 
 
@@ -1114,16 +1405,37 @@ def teardown(session, by="down"):
 
 def cmd_down(session, all_):
     if all_:
-        n = sum(1 for m in instances() if teardown(m["session"]))
-        print(f"down: {n} instance(s)")
+        with slot_lock():
+            n = sum(1 for m in instances() if teardown(m["session"]))
+        print(f"down: {n} browser(s)")
         return 0
     session = session or os.environ.get("CLAUDE_SESSION_ID")
     if not session:
         die("which session? pass <session> or export CLAUDE_SESSION_ID")
-    if teardown(session):
+    check_name("session", session)
+    if os.path.isdir(sdir(session)) and session.startswith(("acct-", "pair-")):
+        with slot_lock():
+            teardown(session)                  # a browser named directly: every attached agent loses it
         print(f"down: {session}")
-    else:
-        print(f"down: no instance for {session}")
+        return 0
+    with slot_lock():
+        m, a = find_attached(session)
+        if not m:
+            print(f"down: no browser for {session}")
+            return 0
+        if m.get("attached") is None:          # 0.1.x per-session instance
+            teardown(m["session"])
+            print(f"down: {m['session']}")
+            return 0
+        meta = update_meta(m["dir"], lambda mt: mt.__setitem__(
+            "attached", [x for x in mt.get("attached", []) if x.get("session") != session]))
+        log_event("detach", session=session, instance=m["session"], by="down")
+        if not meta["attached"]:
+            teardown(m["session"], by="last-detach")
+            print(f"down: {session} detached; last agent, {m['session']} torn down")
+        else:
+            rewrite_card(m["dir"])
+            print(f"down: {session} detached from {m['session']} ({len(meta['attached'])} agent(s) remain)")
     return 0
 
 
@@ -1171,37 +1483,16 @@ def cmd_gc(older_than):
             if p.endswith(".app") and p not in live_apps and not young:
                 shutil.rmtree(p, ignore_errors=True)
                 print(f"gc: orphan dock app {a}")
-    for m in instances():
-        dead = not m["running"]
-        old = (m.get("age_hours") or 0) >= older_than
-        if (dead or old) and teardown(m["session"], by="gc-dead" if dead else "gc-old"):
-            n += 1
-            print(f"gc: {m['session']} ({'dead' if dead else 'old'})")
+    with slot_lock():
+        prune_attachments()
+        for m in instances():
+            alive = any(x.get("owner_alive") for x in m.get("attachments") or [])
+            why = reap_reason(m) or ("old" if (m.get("age_hours") or 0) >= older_than and not alive else None)
+            if why and teardown(m["session"], by=f"gc-{why}"):
+                n += 1
+                print(f"gc: {m['session']} ({why})")
     print(f"gc: {n} removed")
     return 0
-
-
-def cmd_test_device_id(account):
-    """Clone, reset, launch, read id. PASS if the clone minted a NEW id."""
-    st = template_status(account)
-    if not st.get("ready"):
-        die(f"template {account} not ready", 2)
-    session = f"test-device-id-{int(time.time())}"
-    ns = argparse.Namespace(account=account, session=session, name=f"{account} · device-id test",
-                            no_graft=True, new_device_id=True, wait=300, origin=None,
-                            purpose="device-id-test", sites=None)
-    rc = cmd_up(ns)
-    meta = read_json(os.path.join(sdir(session), "instance.json"), {}) or {}
-    print()
-    print(f"overlay id  : {st.get('device_id')}")
-    print(f"clone id    : {meta.get('device_id')}")
-    if rc == 0 and meta.get("device_id") and meta["device_id"] != st.get("device_id"):
-        print("PASS — reset clone minted a new device id. In an agent on this account,")
-        print("       list_connected_browsers should now show the clone's id.")
-    else:
-        print("FAIL — see warnings above. The instance is left up for inspection.")
-    print(f"(instance left running: claude-browser down {session})")
-    return 0 if rc == 0 else 3
 
 
 # ------------------------------------------------------------------- app copy
@@ -1308,19 +1599,17 @@ def main():
     pr.add_argument("account")
     pr.add_argument("--wait", type=int, default=600)
 
-    u = sub.add_parser("up", help="launch this session's browser")
+    u = sub.add_parser("up", help="attach this session to its account's browser (launching it if needed)")
     u.add_argument("--account")
     u.add_argument("--session")
-    u.add_argument("--name")
     u.add_argument("--purpose", help="REQUIRED one word: what this browser is for (bank, shop, tickets…)")
     u.add_argument("--sites", help="REQUIRED unless --no-graft: comma-separated hosts whose cookies to copy in")
     u.add_argument("--origin", help="text naming where the driving agent runs (overrides pane detection)")
     u.add_argument("--no-graft", action="store_true")
-    u.add_argument("--new-device-id", action="store_true")
     u.add_argument("--wait", type=int, default=300,
                    help="seconds to wait for the extension to mint its device id (0 = don't wait)")
 
-    d = sub.add_parser("down", help="tear down a session's browser")
+    d = sub.add_parser("down", help="detach a session (the last one out tears the browser down)")
     d.add_argument("session", nargs="?")
     d.add_argument("--all", action="store_true")
 
@@ -1339,9 +1628,6 @@ def main():
     c = sub.add_parser("config", help="print the effective configuration")
     c.add_argument("--json", action="store_true")
 
-    te = sub.add_parser("test")
-    tes = te.add_subparsers(dest="test")
-    tes.add_parser("device-id").add_argument("account")
 
     app = sub.add_parser("app", help="the icon-bearing Chrome copies agent instances launch from")
     apps = app.add_subparsers(dest="acmd")
@@ -1379,10 +1665,6 @@ def main():
         return cmd_gc(args.older_than)
     if args.cmd == "config":
         return cmd_config(args.json)
-    if args.cmd == "test":
-        if args.test == "device-id":
-            return cmd_test_device_id(args.account)
-        te.print_help(); return 1
     ap.print_help()
     return 1
 

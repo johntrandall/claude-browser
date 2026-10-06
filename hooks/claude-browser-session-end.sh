@@ -20,5 +20,5 @@ SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 [ -n "$SESSION_ID" ] || exit 0
 # Only a plain id (Claude Code uses UUIDs) is passed on.
 [[ "$SESSION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 0
-"$CB" down "$SESSION_ID" >/dev/null 2>&1 || true
+CLAUDE_SESSION_ID="$SESSION_ID" "$CB" down "$SESSION_ID" >/dev/null 2>&1 || true
 exit 0
