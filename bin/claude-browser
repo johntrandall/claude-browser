@@ -13,13 +13,15 @@ This tool gives each session its own Chrome INSTANCE (own --user-data-dir),
 cloned on demand from a shared BASE plus a small per-account pairing OVERLAY.
 Because the clone is a fresh, unloaded directory, the cookies the session needs
 are copied into it *before* Chrome opens it: the account's claude.ai session from
-that account's profile in your main Chrome, and site cookies for the hosts the
-agent declares. The window, Dock icon and first tab name the session and its
-purpose. At session end the instance is deleted.
+that account's golden identity (or, without one, its profile in your main Chrome),
+and site cookies for the hosts the agent declares. The window, Dock icon and
+first tab name the session and its purpose. At session end the instance is deleted.
 
 Layout (under the root, default ~/Library/Application Support/Chrome-Claude/):
   templates/_base/                shared parent: Chrome skeleton + Claude extension, NO identity
   templates/<account>/            the account's pairing (extension local storage) + overlay.json
+  templates/<account>/identity/   the account's golden claude.ai login: a never-paired user-data-dir
+                                  created fresh (not a base clone); run briefly to refresh
   sessions/acct-<account>/        the account's shared agent browser = clone of _base + pairing + cookies;
                                   instance.json lists the attached agent sessions
   icons/                          generated Dock icons (from your installed Chrome's icon)
@@ -32,9 +34,15 @@ Chrome gone, every agent's process gone, or idle) tears it down.
 
 Subcommands
   template init               create the base; one human click, once per Mac (Add to Chrome)
+  template init --rebuild [--with EXT ...]   build a fresh base beside the old one, swap it in
+  template add-extension EXT  add a Web Store extension to the base (one human click)
   template pair <account>     pair an account: base clone signed in from the account's main-Chrome
                               profile; a human clicks the extension once; pairing saved
   template check <account>    base + pairing ready?
+  template identity seed <account>|--all     copy the claude.ai login from the main-Chrome profile
+  template identity refresh <account>|--all [--if-older-than H]
+                              open the identity hidden on claude.ai for a while, quit, record the expiry
+  template identity login <account>          sign in to claude.ai in the identity's own window
   template list
   up --purpose W --sites H[,H] [--account A] [--session S] [--origin T] [--no-graft]
                               attach this session to its account's browser, launching it (with ONLY
@@ -43,7 +51,8 @@ Subcommands
   list [--json]               browsers and their attached agents (purpose, owner alive, origin)
   resolve <device-id>         which browser/agents own this device id
   events [--since H] [--json] the event log
-  gc [--older-than HOURS]     tear down browsers that are dead, abandoned, idle or old
+  gc [--older-than HOURS]     tear down browsers that are dead, abandoned, idle or old; refresh
+                              at most one golden identity older than identity_refresh_hours
   app build|check             icon-bearing Chrome copies used for agent instances
   config                      print the effective configuration
 
@@ -61,7 +70,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -133,6 +142,8 @@ def effective_config():
         "native_messaging_hosts": NMH_MAIN,
         "idle_minutes": IDLE_MINUTES,
         "owner_process_names": sorted(OWNER_NAMES),
+        "identity_refresh_hours": IDENTITY_REFRESH_HOURS,
+        "identity_refresh_seconds": IDENTITY_REFRESH_SECONDS,
         "grafter": GRAFTER,
         "claude_hosts": CLAUDE_HOSTS,
         "allowed_sites": ALLOWED_SITES or None,
@@ -175,7 +186,7 @@ def main_chrome_profile_for(account):
 
 
 def known_accounts():
-    names = set(accounts_map())
+    names = set(accounts_map()) | set(_account_entries())   # `{}` entries: golden identity only
     if os.path.isdir(TEMPLATES):
         names |= {a for a in os.listdir(TEMPLATES) if not a.startswith((".", "_"))
                   and os.path.isdir(os.path.join(TEMPLATES, a))}
@@ -395,6 +406,11 @@ class slot_lock:
 
 
 OWNER_NAMES = set(CFG.get("owner_process_names") or ["claude"])
+# The golden claude.ai identity (templates/<account>/identity/): `gc` refreshes
+# one whose last refresh is older than this (0 = never), keeping its Chrome open
+# for identity_refresh_seconds so claude.ai can load.
+IDENTITY_REFRESH_HOURS = float(CFG.get("identity_refresh_hours", 24) or 0)
+IDENTITY_REFRESH_SECONDS = max(0.0, float(CFG.get("identity_refresh_seconds", 90)))
 
 
 def owner_pid():
@@ -543,23 +559,9 @@ def extension_installed(user_data_dir, ext):
 
 
 def _db_has_claude_session(db):
-    """Presence check on a copy of a Cookies DB (the live one is locked).
-    Nothing is decrypted."""
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    try:
-        shutil.copy(db, tmp)
-        c = sqlite3.connect(tmp)
-        n = c.execute("select count(*) from cookies where host_key like '%claude.ai' and name='sessionKey'").fetchone()[0]
-        c.close()
-        return n > 0
-    except Exception:
-        return False
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    """A live claude.ai sessionKey (exact host, not expired), from a copy of a
+    Cookies DB (the live one is locked). Nothing is decrypted."""
+    return _db_session_expiry(db)[0]
 
 
 def main_profile_cookies(account):
@@ -673,6 +675,27 @@ def make_icon(out, account=None, label=None, sublabel=None):
     return r.returncode == 0 and os.path.isfile(out), (r.stderr or r.stdout).strip()
 
 
+DOCK_APPS = os.path.join(ROOT, "dock-apps.json")
+
+
+def _dock_apps():
+    """dock-apps.json: a list of paths. Anything else is ignored (gc then removes nothing)."""
+    v = read_json(DOCK_APPS, [])
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _remember_dock_app(path):
+    """Record a Dock app this root created. gc only ever removes apps on this
+    list: apps_dir can be shared by several roots (a test root, a second
+    config), and an app another root is running must never look orphaned."""
+    try:
+        apps = set(_dock_apps())
+        apps.add(path)
+        write_json(DOCK_APPS, sorted(apps))
+    except OSError:
+        pass
+
+
 def build_instance_app(user_data_dir, account, purpose, identity, session):
     """One app copy per instance so the Dock shows WHAT it does and WHERE it is
     driven from: icon = account disc + purpose plate + origin line; app name =
@@ -698,6 +721,7 @@ def build_instance_app(user_data_dir, account, purpose, identity, session):
         shutil.rmtree(path, ignore_errors=True)
         return None
     subprocess.run(["fileicon", "set", path, icon], capture_output=True)
+    _remember_dock_app(path)
     return path
 
 
@@ -735,11 +759,181 @@ def wait_for_device_id(user_data_dir, timeout=25):
 
 # --------------------------------------------------------------- templates
 
+EXT_ID_RE = re.compile(r"^[a-p]{32}$")      # Chrome Web Store extension ids
+NEW_BASE = BASE + ".new"
+
+
+class base_build_lock:
+    """One `template add-extension` / `template init --rebuild` at a time: both
+    build in templates/_base.new. Non-blocking: a second run is refused."""
+    def __enter__(self):
+        import fcntl
+        os.makedirs(ROOT, exist_ok=True)
+        self.fh = open(os.path.join(ROOT, "base-build.lock"), "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fh.close()
+            die("another `template add-extension` or `template init --rebuild` is running; let it finish")
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def _prepare_new_base():
+    """An empty slot for the new base. A leftover _base.new is from a failed
+    run (base_build_lock is held): removed, if it is a plain dir and closed."""
+    if os.path.lexists(NEW_BASE):
+        if os.path.islink(NEW_BASE) or not os.path.isdir(NEW_BASE) or not inside(NEW_BASE, TEMPLATES):
+            die(f"refusing: {NEW_BASE} is not a plain directory in {TEMPLATES}; move it aside")
+        if chrome_pids(NEW_BASE):
+            die(f"a Chrome window is open on {NEW_BASE}; quit it, then rerun")
+        shutil.rmtree(NEW_BASE)
+    return NEW_BASE
+
+
+def _run_base_window(new, urls, wait, steps):
+    """Open Chrome on NEW and wait for the human to quit it. No early exit
+    before Chrome is up: a slow start must not look like a finished window."""
+    launch(new, urls, app=CHROME_APP)
+    print(steps + f"\nWaiting up to {wait}s…")
+    t0 = time.time()
+    while not chrome_pids(new) and time.time() - t0 < 60:
+        time.sleep(0.5)
+    if not chrome_pids(new):
+        die(f"Chrome did not start on {new}; nothing changed", 3)
+    while chrome_pids(new) and time.time() - t0 < wait:
+        time.sleep(2)
+    if chrome_pids(new):
+        die(f"the window is still open after {wait}s; quit it, then rerun this command (nothing changed)", 3)
+    for _ in range(40):
+        if not is_open(new):
+            break
+        time.sleep(0.5)
+
+
+def _base_problems(d, exts):
+    """Why D cannot be the base: a missing extension, a pairing, stray Claude cookies."""
+    out = []
+    missing = [e for e in exts if not extension_installed(d, e)]
+    if missing:
+        out.append("extension(s) not installed: " + ", ".join(missing))
+    if device_id(d):
+        out.append("the Claude extension paired in that window (a base holds no pairing; don't click it)")
+    probs = base_cookie_problems(cookie_census(d), bool(cookies_db(d)))
+    if probs:
+        out.append("it holds " + "; ".join(probs) + " (sign in to nothing in that window; extension setup "
+                   "such as connecting a password manager to its desktop app is fine)")
+    return out
+
+
+def _swap_in_base(new, extensions, how):
+    """Swap NEW in as the base under slot_lock (so `up` never clones half a
+    base), with rollback if the second rename fails; the old base is trashed."""
+    old = None
+    with slot_lock():
+        if os.path.isdir(BASE) and is_open(BASE):
+            die("the base is open in Chrome; quit it, then rerun (nothing changed)")
+        tj = read_json(os.path.join(new, "template.json"), {}) or {}
+        tj.update(kind="base", extensions=sorted(set(extensions)), updated=time.strftime("%Y-%m-%d %H:%M:%S"),
+                  how=how)
+        tj.setdefault("created", tj["updated"])
+        write_json(os.path.join(new, "template.json"), tj)
+        if os.path.lexists(BASE):
+            old = BASE + time.strftime(".old-%Y%m%d%H%M%S")
+            os.rename(BASE, old)
+        try:
+            os.rename(new, BASE)
+        except OSError as e:
+            if old:
+                os.rename(old, BASE)
+            die(f"could not swap in the new base ({e}); the old base is back in place", 3)
+    if old:
+        # The replaced base is disposable: the new one has passed its checks.
+        # Deleted outright (not trashed), like ended session clones.
+        if inside(old, TEMPLATES):
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def cmd_template_add_extension(ext, wait=900):
+    """Add a Web Store extension (e.g. a password manager) to the shared base,
+    so every agent browser launched afterwards has it. One human step: Add to
+    Chrome in the window this opens, finish the extension's own setup there if
+    it asks (e.g. connect it to its desktop app), then Cmd-Q. The new base is
+    built beside the old one (a clone) and swapped in under the lock, so a
+    concurrent `up` never clones a half-built base. Running browsers keep
+    theirs until they are relaunched."""
+    if not EXT_ID_RE.fullmatch(ext or ""):
+        die(f"{ext!r} is not a Chrome Web Store extension id (32 letters a-p)")
+    bs = base_status()
+    if not bs.get("ready"):
+        die("base not ready: " + "; ".join(base_not_ready_reasons(bs)), 2)
+    if extension_installed(BASE, ext):
+        print(f"base already has extension {ext}")
+        return 0
+    exts = sorted(set(((read_json(os.path.join(BASE, "template.json"), {}) or {}).get("extensions") or [])
+                      + [EXT_CLAUDE, ext]))
+    with base_build_lock():
+        new = _prepare_new_base()
+        clone_base(new)
+        _run_base_window(new, [f"https://chromewebstore.google.com/detail/{ext}"], wait, """HUMAN STEPS, in the new Chrome window:
+  1. Add to Chrome → Add extension.
+  2. If the extension asks for setup (e.g. connect to its desktop app), do it. Sign in to nothing else.
+  3. Quit that window (Cmd-Q).""")
+        problems = _base_problems(new, [EXT_CLAUDE, ext])
+        if problems:
+            shutil.rmtree(new, ignore_errors=True)
+            die("nothing changed: " + "; ".join(problems), 3)
+        _swap_in_base(new, exts, f"add-extension {ext}")
+    log_event("base-extension-added", extension=ext)
+    print(f"base now has extension {ext}; browsers launched from now on include it "
+          f"(running ones get it when they are next launched)")
+    return 0
+
+
+def cmd_template_rebuild(with_exts=(), wait=900):
+    """Rebuild the base from nothing: an empty user-data-dir (not a clone, so it
+    inherits no cookie, login or pairing), opened at the Web Store page of the
+    Claude extension and of each --with extension. The human adds them all,
+    does any extension setup, and quits. Verified (every extension installed,
+    no pairing, no Claude cookie), then swapped in under the lock."""
+    for e in with_exts:
+        if not EXT_ID_RE.fullmatch(e or ""):
+            die(f"{e!r} is not a Chrome Web Store extension id (32 letters a-p)")
+    exts = [EXT_CLAUDE] + [e for e in dict.fromkeys(with_exts) if e != EXT_CLAUDE]
+    with base_build_lock():
+        new = _prepare_new_base()
+        os.makedirs(os.path.join(new, "Default"))
+        ensure_native_hosts(new)
+        set_profile_name(new, "claude-browser base")
+        names = "Claude in Chrome" + (f" and {len(exts) - 1} more" if len(exts) > 1 else "")
+        _run_base_window(new, [f"https://chromewebstore.google.com/detail/{e}" for e in exts], wait,
+                         f"""HUMAN STEPS, in the new Chrome window ({len(exts)} tab(s): {names}):
+  1. In each tab: Add to Chrome → Add extension. Do NOT click the Claude extension's icon.
+  2. Do any extension setup (e.g. connect a password manager to its desktop app). Sign in to no website.
+  3. Quit that window (Cmd-Q).""")
+        problems = _base_problems(new, exts)
+        if problems:
+            shutil.rmtree(new, ignore_errors=True)
+            die("the old base is unchanged: " + "; ".join(problems), 3)
+        _swap_in_base(new, exts, "rebuild")
+    log_event("base-rebuilt", extensions=exts)
+    print(f"base rebuilt with {len(exts)} extension(s): {', '.join(exts)}; browsers launched from now on use it")
+    return 0
+
+
 def cmd_template_init():
     """Create the shared BASE: a fresh Chrome profile with the Claude extension
     installed and nothing else. One human step, once per Mac: Add to Chrome."""
     if os.path.isdir(os.path.join(BASE, "Default")) and extension_installed(BASE, EXT_CLAUDE):
         print(f"base already exists with the extension: {BASE}")
+        reasons = base_not_ready_reasons(base_status())
+        if reasons:
+            print("  but it is NOT ready: " + "; ".join(reasons))
+            return 2
         return 0
     os.makedirs(os.path.join(BASE, "Default"), exist_ok=True)
     write_json(os.path.join(BASE, "template.json"), {
@@ -765,20 +959,55 @@ def base_status():
     extdir = os.path.join(BASE, "Default", "Extensions")
     st["extension_count"] = len([e for e in os.listdir(extdir) if not e.startswith(".")]) if os.path.isdir(extdir) else 0
     st["stray_pairing"] = device_id(BASE)   # must be None: identity never lives in the base
-    st["ready"] = bool(st["claude_extension"] and not st["open"])
+    # Must be zero: every clone starts with the base's cookies, so a Claude
+    # cookie here (a login) would sign every browser and identity in as someone.
+    c = cookie_census(BASE)
+    problems = base_cookie_problems(c, bool(cookies_db(BASE)))
+    c = c or {"claude_rows": 0, "session_key_rows": 0}
+    st["stray_cookies"] = {"claude_rows": c["claude_rows"], "session_key_rows": c["session_key_rows"],
+                           "problems": problems}
+    st["clean"] = not problems
+    st["ready"] = bool(st["claude_extension"] and not st["open"] and st["clean"])
     return st
+
+
+def base_not_ready_reasons(bs):
+    if not bs.get("exists"):
+        return ["no base template (claude-browser template init)"]
+    why = []
+    if not bs.get("claude_extension"):
+        why.append("Claude in Chrome extension not installed in the base (claude-browser template init)")
+    if bs.get("open"):
+        why.append("base is open in Chrome (quit that instance)")
+    if not bs.get("clean", True):
+        sc = bs.get("stray_cookies") or {}
+        why.append(f"the base holds {'; '.join(sc.get('problems') or ['stray cookies'])}: rebuild the base: "
+                   f"claude-browser template init --rebuild")
+    return why
+
+
+def base_clean_note():
+    """For "clone keeps none" messages: true only if the base is clean."""
+    bs = base_status()
+    if bs.get("clean", True):
+        return "base clean"
+    return "WARNING: " + base_not_ready_reasons(bs)[-1]
 
 
 def template_status(account):
     """An account is ready when the shared base is ready and the account has a
     pairing overlay with a device id. Its claude.ai session comes from the
-    account's main-Chrome profile at every launch (informational here)."""
+    account's golden identity (else its main-Chrome profile) at every launch
+    (informational here)."""
     bs = base_status()
     d = tdir(account)
     slots = account_slots(account)
     st = {"account": account, "dir": d, "exists": bool(slots), "base": bs, "slots": slots}
     st["device_id"] = next(iter(slots.values()), None)
-    st["claude_session"] = main_profile_has_session(account)
+    st["identity"] = identity_status(account)
+    st["main_session"] = main_profile_has_session(account)
+    # Whether clones will be signed in: the golden identity wins when it exists.
+    st["claude_session"] = st["identity"]["session"] if st["identity"]["exists"] else st["main_session"]
     st["claude_extension"] = bs.get("claude_extension", False)
     st["open"] = bs.get("open", False)
     meta = read_json(os.path.join(d, "overlay.json"), {}) or {}
@@ -792,13 +1021,17 @@ def cmd_template_check(account):
     bs = st["base"]
     if not bs.get("exists"):
         die("no base template: run  claude-browser template init", 2)
-    for k in ("claude_extension", "open", "extension_count", "stray_pairing"):
+    for k in ("claude_extension", "open", "extension_count", "stray_pairing", "stray_cookies"):
         print(f"  base {k:20} {bs.get(k)}")
     for k in ("exists", "paired", "claude_session"):
         print(f"  {account} {k:17} {st.get(k)}")
+    print(f"  {account} {identity_line(account)}")
     print(f"  {account} {'slots':17} {len(st['slots'])}: " + ", ".join(f"{n}={d[:8]}" for n, d in st["slots"].items()))
     if st["ready"]:
-        if st["claude_session"] is None:
+        if st["identity"]["exists"] and not st["claude_session"]:
+            print(f"  note: the golden identity has no claude.ai session; clones will not be signed in "
+                  f"(claude-browser template identity login {account})")
+        elif st["claude_session"] is None:
             print(f"  note: no main-Chrome profile is mapped to {account} (config `accounts`); "
                   f"clones will not be signed in to claude.ai")
         elif st["claude_session"] is False:
@@ -806,11 +1039,7 @@ def cmd_template_check(account):
                   f"the clone will not be signed in until you sign in there")
         print(f"READY: {account} can be cloned (base + overlay)")
         return 0
-    why = []
-    if not bs.get("claude_extension"):
-        why.append("Claude in Chrome extension not installed in the base (claude-browser template init)")
-    if bs.get("open"):
-        why.append("base is open in Chrome (quit that instance)")
+    why = base_not_ready_reasons(bs)
     if not st["device_id"]:
         why.append(f"no pairing overlay for {account} (claude-browser template pair {account})")
     die("NOT READY: " + "; ".join(why), 2)
@@ -832,13 +1061,18 @@ def cmd_template_list():
     if not bs.get("exists"):
         print("no base template (claude-browser template init)")
         return 0
+    sc = bs.get("stray_cookies") or {}
     print(f"base       ext={bs.get('claude_extension')} open={bs.get('open')} extensions={bs.get('extension_count')} "
-          f"stray_pairing={bs.get('stray_pairing')}  {BASE}")
+          f"stray_pairing={bs.get('stray_pairing')} stray_cookies={sc.get('claude_rows')}/{sc.get('session_key_rows')}"
+          f"  {BASE}")
+    for r in base_not_ready_reasons(bs):
+        print(f"  NOT READY: {r}")
     for a in known_accounts():
         st = template_status(a)
         slots = ",".join(f"{n}={d[:8]}" for n, d in st["slots"].items()) or "-"
         print(f"{a:10} ready={st.get('ready')}  slots={len(st['slots'])} [{slots}]  "
-              f"main_profile={main_chrome_profile_for(a)} session={st.get('claude_session')}")
+              f"main_profile={main_chrome_profile_for(a)} session={st.get('main_session')}")
+        print(f"{'':10} {identity_line(a)}")
     return 0
 
 
@@ -857,18 +1091,27 @@ def save_overlay(account, src_store, how, slot=1):
 
 def cmd_template_pair(account, wait=600, slots=None):
     """(Re)pair an account: a base clone WITHOUT pairing, signed in to claude.ai
-    from the account's main-Chrome profile. The human clicks the Claude
+    from the account's golden identity (else its main-Chrome profile). The human clicks the Claude
     extension once; the resulting local storage (device id + auth hand-off) is
     saved as the account's pairing (slot 1, overwritten if it exists)."""
     bs = base_status()
     if not bs.get("ready"):
-        die("base not ready (claude-browser template check <account>)", 2)
-    src = main_chrome_profile_for(account)
-    if not src:
-        die(f"no main-Chrome profile mapped to {account}: add it to config `accounts` "
-            f"(e.g. \"{account}\": \"Profile 3\"), see `claude-browser config`", 2)
-    if main_profile_has_session(account) is not True:
-        die(f"{src} in main Chrome has no claude.ai session for {account}; sign in to claude.ai there first", 2)
+        die("base not ready: " + "; ".join(base_not_ready_reasons(bs)), 2)
+    ist = identity_status(account)
+    if ist["exists"]:
+        # The golden identity signs the pairing window in; no main-Chrome profile needed.
+        if not ist["session"]:
+            die(f"the golden identity of {account} has no claude.ai session: "
+                f"claude-browser template identity login {account}", 2)
+    else:
+        src = main_chrome_profile_for(account)
+        if not src:
+            die(f"no golden identity and no main-Chrome profile for {account}: "
+                f"claude-browser template identity login {account} (or map a profile in config `accounts` "
+                f"and run template identity seed {account})", 2)
+        if main_profile_has_session(account) is not True:
+            die(f"{src} in main Chrome has no claude.ai session for {account}; sign in to claude.ai there, "
+                f"or claude-browser template identity login {account}", 2)
     have = account_slots(account)
     if slots:
         missing = [n for n in range(1, int(slots) + 1) if n not in have]
@@ -885,10 +1128,11 @@ def cmd_template_pair(account, wait=600, slots=None):
             print(f"  slot {n}: pairing window still open, waiting for the click again")
             log_event("pair-resume", session=session, account=account, slot=n)
         else:
-            if os.path.isdir(dst):
-                teardown(session, by="pair-restart")
-            dst = clone_template(account, session, slot=None)
-            reset_device_id(dst)
+            with slot_lock():           # never clone a base that is being swapped
+                if os.path.isdir(dst):
+                    teardown(session, by="pair-restart")
+                dst = clone_template(account, session, slot=None)
+                reset_device_id(dst)
             print(f"  slot {n} identity: {refresh_claude_identity(dst, account)}")
             set_profile_name(dst, f"{account} · pair slot {n}")
             identity = caller_identity()
@@ -952,15 +1196,7 @@ def clone_template(account, session, slot=None):
     if os.path.exists(dst):
         die(f"instance already exists for session {session}: {dst}\n(run  claude-browser down {session}  first)")
     os.makedirs(SESSIONS, exist_ok=True)
-    # APFS clonefile: instant, copy-on-write.
-    r = subprocess.run(["cp", "-Rc", src, dst], capture_output=True, text=True)
-    if r.returncode != 0:
-        shutil.copytree(src, dst, symlinks=True)
-    # Never carry a lock or a running-state marker into the clone.
-    for junk in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"):
-        p = os.path.join(dst, junk)
-        if os.path.lexists(p):
-            os.unlink(p)
+    clone_base(dst)
     if slot is not None:
         store = slot_store(account, slot)
         if not os.path.isdir(store):
@@ -968,6 +1204,19 @@ def clone_template(account, session, slot=None):
         reset_device_id(dst)
         shutil.copytree(store, ext_settings(dst))
     return dst
+
+
+def clone_base(dst, src=None):
+    """APFS clonefile of the base (instant, copy-on-write), minus Chrome's
+    lock and running-state markers."""
+    src = src or BASE
+    r = subprocess.run(["cp", "-Rc", src, dst], capture_output=True, text=True)
+    if r.returncode != 0:
+        shutil.copytree(src, dst, symlinks=True)
+    for junk in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"):
+        p = os.path.join(dst, junk)
+        if os.path.lexists(p):
+            os.unlink(p)
 
 
 def reset_device_id(user_data_dir):
@@ -1128,28 +1377,580 @@ profile. It is deleted when the last agent detaches. Sites grafted at launch: {e
     return path
 
 
-def refresh_claude_identity(user_data_dir, account):
-    """At every launch, re-copy ONLY the claude.* identity cookies from this
-    account's own profile in the main Chrome into the clone, so the clone's
-    claude.ai session is as fresh as the one in use there. Skipped when the
-    source has no live sessionKey."""
-    src, src_db = main_profile_cookies(account)
-    if not src:
-        return "no main-Chrome profile mapped to this account (config `accounts`)"
-    if not src_db or not _db_has_claude_session(src_db):
-        return f"{src} has no claude.ai session; clone keeps none"
-    if not grafter_ok():
-        return "grafter missing"
-    cfg = {"source": src, "targets": [os.path.join(user_data_dir, "Default")],
+def _graft_claude(chrome_dir, source, user_data_dir):
+    """Copy ONLY the claude.* identity cookies from profile SOURCE of the Chrome
+    user-data-dir CHROME_DIR into USER_DATA_DIR's Default profile, overwriting
+    what is there. Returns (ok, the grafter's last line)."""
+    cfg = {"source": source, "targets": [os.path.join(user_data_dir, "Default")],
            "only": CLAUDE_HOSTS, "protect": ["chrome-extension://*"], "exclude": [],
            "stale_days": 365, "keep_backups": 1, "min_interval_minutes": 0}
     cfg_path = os.path.join(user_data_dir, "identity-graft-config.json")
     write_json(cfg_path, cfg)
-    r = subprocess.run([GRAFTER, "-c", cfg_path, "--chrome-dir", MAIN_CHROME, "--force", "--replace-all",
+    r = subprocess.run([GRAFTER, "-c", cfg_path, "--chrome-dir", chrome_dir, "--force", "--replace-all",
                         "--state", os.path.join(user_data_dir, "identity-state.json")],
                        capture_output=True, text=True)
     last = (r.stdout + r.stderr).strip().splitlines()[-1:] or ["?"]
-    return f"from {src}: {last[0].strip()}" if r.returncode == 0 else f"FAILED from {src}: {last[0].strip()}"
+    return r.returncode == 0, last[0].strip()
+
+
+def refresh_claude_identity(user_data_dir, account):
+    """At every launch, re-copy ONLY the claude.* identity cookies into the
+    clone. Source: the account's golden identity (templates/<account>/identity/)
+    when it exists; only when there is none, the account's profile in the main
+    Chrome. Skipped when the source has no sessionKey."""
+    ist = identity_status(account)
+    if ist["exists"]:
+        if not ist["session"]:
+            return (f"golden identity has no live claude.ai session; clone keeps none ({base_clean_note()}) "
+                    f"(claude-browser template identity login {account})")
+        if not grafter_ok():
+            return "grafter missing"
+        # Reading a copy of the DB is safe while a refresh has it open (the
+        # grafter snapshots its source, as it does from the always-open main Chrome).
+        ok, last = _graft_claude(ist["dir"], "Default", user_data_dir)
+        how = f"from golden identity (sessionKey expires {(ist.get('expires') or '?')[:10]})"
+        return f"{how}: {last}" if ok else f"FAILED {how}: {last}"
+    src, src_db = main_profile_cookies(account)
+    if not src:
+        return ("no golden identity and no main-Chrome profile mapped to this account; clone keeps none "
+                f"({base_clean_note()}) (claude-browser template identity login {account})")
+    how = f"from main-Chrome profile {src} (no golden identity: claude-browser template identity seed {account})"
+    if not src_db or not _db_has_claude_session(src_db):
+        return f"{src} has no live claude.ai session; clone keeps none ({base_clean_note()})"
+    if not grafter_ok():
+        return "grafter missing"
+    ok, last = _graft_claude(MAIN_CHROME, src, user_data_dir)
+    return f"{how}: {last}" if ok else f"FAILED {how}: {last}"
+
+
+# ---------------------------------------------------------- golden identity
+#
+# templates/<account>/identity/ is a user-data-dir that holds the account's
+# claude.ai login. It is created FRESH (an empty dir Chrome builds its own
+# skeleton in), never cloned from the base, so it inherits nothing; the login is
+# then grafted in (seed) or typed in by a human (login). It is a full Chrome
+# profile: a human sign-in there (Google SSO, say) or a refresh can leave other
+# sites' cookies in it. Those never reach agent browsers: the graft out of it
+# copies CLAUDE_HOSTS only. It is never paired, attached or listed as a browser,
+# and runs only briefly: hidden, to let claude.ai load (`template identity
+# refresh`, and `gc` once a day), or visibly for a human sign-in (`template
+# identity login`). It always runs with --disable-extensions.
+
+def identity_dir(account):
+    # Lowercase, like sessions/acct-<account>: the --user-data-dir text must not
+    # depend on how a caller spelled the account (APFS ignores case, `ps` does not).
+    parent = os.path.join(TEMPLATES, check_name("account", account).lower())
+    d = os.path.join(parent, "identity")
+    if os.path.lexists(d) and not inside(d, parent):
+        die(f"refusing {d}: it resolves outside {parent}")
+    return d
+
+
+def identity_meta_path(account):
+    return os.path.join(identity_dir(account), "identity.json")
+
+
+CHROME_EPOCH_OFFSET = 11644473600     # seconds from 1601-01-01 (Chrome's epoch) to 1970-01-01
+CLAUDE_SESSION_HOSTS = {"claude.ai", ".claude.ai"}   # where claude.ai keeps sessionKey
+
+
+def chrome_time_str(expires_utc):
+    """Chrome's expires_utc (µs since 1601) as local time; 0 = a session cookie."""
+    if expires_utc is None:
+        return None
+    if not expires_utc:
+        return "session-only"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires_utc / 1e6 - CHROME_EPOCH_OFFSET))
+
+
+def chrome_now():
+    return int((time.time() + CHROME_EPOCH_OFFSET) * 1e6)
+
+
+def _cookie_meta_rows(db):
+    """(host_key, name, expires_utc) of every row, from a copy of a Cookies DB
+    (the live one may be locked). Values are never selected or decrypted.
+    None if unreadable."""
+    if not db:
+        return None
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        shutil.copy(db, tmp)
+        c = sqlite3.connect(tmp)
+        rows = c.execute("select host_key, name, expires_utc from cookies").fetchall()
+        c.close()
+        return rows
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _db_session_expiry(db):
+    """(a live claude.ai sessionKey is present, the newest such row's expires_utc).
+    Live = host exactly claude.ai / .claude.ai and not yet expired. An expired
+    row still reports its expiry (so `template list` can show when it lapsed)."""
+    rows = [(h, e) for (h, n, e) in (_cookie_meta_rows(db) or [])
+            if n == "sessionKey" and (h or "").lower() in CLAUDE_SESSION_HOSTS]
+    if not rows:
+        return False, None
+    now = chrome_now()
+    return any((e or 0) > now for _, e in rows), max(e or 0 for _, e in rows)
+
+
+def _host_matches(host, patterns):
+    """chrome-cookie-graft's glob rule: '*.example.com' also matches
+    '.example.com', which is how Chrome spells a domain cookie."""
+    import fnmatch
+    h = (host or "").lower()
+    for p in (x.lower() for x in patterns):
+        if fnmatch.fnmatch(h, p) or (p.startswith("*.") and h == p[1:]):
+            return True
+    return False
+
+
+# What may sit in the base. A fresh install leaves Web Store / Google consent
+# and captcha cookies, and the Claude extension may open a claude.ai page
+# (anonymous rows). LOGIN cookies are what must never be there: every clone
+# and every pairing window starts with the base's cookies.
+CLAUDE_LOGIN_NAMES = {"sessionKey", "sessionKeyV3", "lastActiveOrg", "routingHint"}
+GOOGLE_LOGIN_NAMES = {"SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "__Secure-1PSID",
+                      "__Secure-3PSID", "__Host-GAPS", "__Secure-1PAPISID", "__Secure-3PAPISID"}
+BASE_ALLOWED_SUFFIXES = ("google.com", "gstatic.com", "googleusercontent.com", "hcaptcha.com")
+
+
+def _host_under(h, suffix):
+    h = h.lstrip(".")
+    return h == suffix or h.endswith("." + suffix)
+
+
+def cookie_census(user_data_dir):
+    """Counts and host names only (host_key / name, never values): claude-host
+    rows, Claude login rows, Google login rows, and hosts outside what a base
+    may hold. None if there is no readable Cookies DB."""
+    rows = _cookie_meta_rows(cookies_db(user_data_dir))
+    if rows is None:
+        return None
+    claude = [r for r in rows if _host_matches(r[0], CLAUDE_HOSTS)]
+    google = [r for r in rows if _host_under(r[0], "google.com")]
+    foreign = sorted({h for (h, _, _) in rows if not _host_matches(h, CLAUDE_HOSTS)
+                      and not any(_host_under(h, sfx) for sfx in BASE_ALLOWED_SUFFIXES)})
+    return {"claude_rows": len(claude),
+            "session_key_rows": sum(1 for (_, n, _) in claude if n in CLAUDE_LOGIN_NAMES),
+            "google_login_rows": sum(1 for (_, n, _) in google if n in GOOGLE_LOGIN_NAMES),
+            "foreign_hosts": foreign,
+            "rows": len(rows)}
+
+
+def base_cookie_problems(c, cookies_file_exists):
+    """Why a base's cookie jar is not acceptable (empty list = clean)."""
+    if c is None:
+        return ["its Cookies database could not be read"] if cookies_file_exists else []
+    out = []
+    if c["session_key_rows"]:
+        out.append(f"{c['session_key_rows']} claude.ai login cookie(s)")
+    if c["google_login_rows"]:
+        out.append(f"{c['google_login_rows']} Google sign-in cookie(s)")
+    if c["foreign_hosts"]:
+        out.append("cookies for " + ", ".join(c["foreign_hosts"][:8]) + ("…" if len(c["foreign_hosts"]) > 8 else ""))
+    return out
+
+
+def _claude_rows(user_data_dir):
+    c = cookie_census(user_data_dir)
+    return c and c["claude_rows"]
+
+
+def identity_open(d):
+    return bool(chrome_pids(d)) or is_open(d)
+
+
+def identity_status(account):
+    d = identity_dir(account)
+    meta = read_json(os.path.join(d, "identity.json"), {}) or {}
+    st = {"dir": d, "exists": bool(cookies_db(d)), "session": False,
+          "expires_utc": None, "expires": None, "refreshed_at": meta.get("refreshed_at"),
+          "seeded_at": meta.get("seeded_at"), "source": meta.get("source"), "open": False}
+    if st["exists"]:
+        st["session"], st["expires_utc"] = _db_session_expiry(cookies_db(d))
+        st["expires"] = chrome_time_str(st["expires_utc"])
+        st["open"] = identity_open(d)
+    # Hours since the last refresh, else since the seed or login; None = never.
+    last = meta.get("refreshed_ts") or meta.get("seeded_ts")
+    st["age_s"] = (time.time() - last) if last else None
+    st["age_hours"] = round(st["age_s"] / 3600, 3) if last else None
+    return st
+
+
+def identity_line(account):
+    st = identity_status(account)
+    if not st["exists"]:
+        return f"identity: none (claude-browser template identity seed|login {account})"
+    return (f"identity: session={st['session']} expires={(st['expires'] or '-')[:10]} "
+            f"refreshed={st['refreshed_at'] or 'never'} source={st['source'] or '?'}"
+            + (" OPEN" if st["open"] else ""))
+
+
+def _update_identity_meta(account, **fields):
+    """Merge FIELDS into identity.json (None removes a key). Caller holds slot_lock."""
+    path = identity_meta_path(account)
+    meta = read_json(path, {}) or {}
+    for k, v in fields.items():
+        if v is None:
+            meta.pop(k, None)
+        else:
+            meta[k] = v
+    write_json(path, meta)
+    return meta
+
+
+# Who started the identity's Chrome, recorded under the lock BEFORE it is
+# launched, so gc can quit an identity Chrome whose starter died (a gc killed
+# mid-wait, a launch that came up after its timeout, a Ctrl-C'd login).
+ORPHAN_MARGIN_S = 60
+
+
+def _mark_identity_chrome(account, purpose):
+    _update_identity_meta(account, chrome_owner_pid=os.getpid(), chrome_started_ts=time.time(),
+                          chrome_purpose=purpose)
+
+
+def _unmark_identity_chrome(account):
+    _update_identity_meta(account, chrome_owner_pid=None, chrome_started_ts=None, chrome_purpose=None)
+
+
+def _owner_running(pid):
+    """A live claude-browser process (not just any process that reused the pid)."""
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))], capture_output=True, text=True).stdout
+    return "claude-browser" in cmd
+
+
+def quit_identity(d):
+    """Quit the identity's Chrome (SIGTERM, then SIGKILL) and wait until the
+    Cookies DB is closed. Returns True if it went on SIGTERM."""
+    clean = quit_instance(d)
+    if not clean:
+        kill_instance(d, 9)
+    for _ in range(40):
+        if not chrome_pids(d) and not is_open(d):
+            break
+        time.sleep(0.5)
+    return clean
+
+
+def launch_identity(d, url, hidden):
+    """Stock Chrome (not the Dock-app copies), extensions off. hidden: `open -g -j`.
+    The caller has marked the identity's Chrome (_mark_identity_chrome)."""
+    reset_device_id(d)
+    clean_start(d)
+    subprocess.run(["open"] + (["-g", "-j"] if hidden else []) + ["-na", CHROME_APP_SRC, "--args",
+                    f"--user-data-dir={d}", "--profile-directory=Default",
+                    "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+                    "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", url], check=False)
+    for _ in range(30):
+        if chrome_pids(d):
+            return True
+        time.sleep(0.5)
+    # Timed out. A last look, and whatever came up late is quit: this caller is
+    # giving up on it. (One that starts later still is gc's: the mark stays.)
+    time.sleep(2)
+    if chrome_pids(d):
+        quit_identity(d)
+    return False
+
+
+def ensure_identity(account):
+    """Create templates/<account>/identity/ if missing, FRESH: an empty dir that
+    Chrome builds its own profile skeleton in (hidden, extensions off, about:blank).
+    Nothing is cloned, so nothing is inherited. Returns (dir, created).
+    Caller holds slot_lock."""
+    d = identity_dir(account)
+    if cookies_db(d):
+        return d, False
+    if os.path.lexists(d):
+        # A creation that died before Chrome wrote its Cookies DB leaves identity.json.
+        if os.path.isdir(d) and not os.path.islink(d) and os.path.exists(os.path.join(d, "identity.json")) \
+                and not chrome_pids(d):
+            shutil.rmtree(d)
+        else:
+            die(f"{d} exists but is not a claude-browser identity; move it aside first")
+    os.makedirs(os.path.join(d, "Default"))
+    os.chmod(d, 0o700)                          # user-only, like the Cookies file Chrome writes in it
+    set_profile_name(d, f"{account} · claude.ai identity")
+    _mark_identity_chrome(account, "create")
+    if not launch_identity(d, "about:blank", hidden=True):
+        die(f"Chrome did not start on {d}", 3)
+    for _ in range(40):
+        if cookies_db(d):
+            break
+        time.sleep(0.5)
+    time.sleep(1)
+    quit_identity(d)
+    _unmark_identity_chrome(account)
+    census = cookie_census(d)
+    if census is None:
+        die(f"Chrome created no Cookies DB in {d}; run this again", 3)
+    log_event("identity-create", account=account, cookie_rows=census["rows"],
+              claude_rows=census["claude_rows"])
+    return d, True
+
+
+def identity_record(account, **fields):
+    """Rewrite identity.json from what the closed profile holds now."""
+    has, exp = _db_session_expiry(cookies_db(identity_dir(account)))
+    return _update_identity_meta(account, **fields, session_present=has, expires_utc=exp,
+                                 expires=chrome_time_str(exp))
+
+
+def agent_browser_launching(account):
+    """`up` has claimed the account's browser dir but not launched it yet: the
+    window in which it grafts the claude.ai identity. Caller holds slot_lock."""
+    m = next((x for x in instances() if x["session"] == instance_name(account)), None)
+    return bool(m and not m["running"] and not m.get("pid") and (m.get("age_hours") or 0) < SETTLE_HOURS)
+
+
+def identity_refresh_begin(account):
+    """Decide and launch, under slot_lock (the caller holds it): skip when the
+    identity is open or the account's agent browser is mid-launch; otherwise
+    start the hidden Chrome before the lock is released, so the next locker
+    sees it open. Returns (before-status, None) or (None, reason)."""
+    st = identity_status(account)
+    if not st["exists"]:
+        return None, f"no golden identity (claude-browser template identity seed|login {account})"
+    if st["open"]:
+        return None, "open in Chrome"
+    if agent_browser_launching(account):
+        return None, "its agent browser is being launched"
+    if not st["session"]:
+        log_event("identity-stale", account=account, phase="before-refresh")
+        return None, f"no live claude.ai sessionKey (claude-browser template identity login {account})"
+    st["claude_rows"] = _claude_rows(st["dir"])
+    _mark_identity_chrome(account, "refresh")
+    if not launch_identity(st["dir"], "https://claude.ai/", hidden=True):
+        return None, "Chrome did not start"
+    st["t0"] = time.time()
+    return st, None
+
+
+def identity_refresh_finish(account, before, seconds):
+    """Outside the lock: let claude.ai load for SECONDS, quit, record.
+    Whether loading claude.ai moves the sessionKey's expiry is NOT assumed:
+    the event records the expiry before and after."""
+    d = before["dir"]
+    while time.time() - before["t0"] < seconds and chrome_pids(d):
+        time.sleep(1)
+    exited_early = not chrome_pids(d)
+    quit_ok = quit_identity(d)
+    with slot_lock():
+        now = time.time()
+        meta = identity_record(account, refreshed_at=time.strftime("%Y-%m-%d %H:%M:%S"), refreshed_ts=now,
+                               chrome_owner_pid=None, chrome_started_ts=None, chrome_purpose=None)
+    b, a = before.get("expires_utc"), meta.get("expires_utc")
+    moved = None if (b is None or a is None) else round((a - b) / 1e6 / 3600, 2)
+    log_event("identity-refresh", account=account, before=chrome_time_str(b), after=meta.get("expires"),
+              moved_hours=moved, waited_s=round(now - before["t0"]), exited_early=exited_early,
+              quit_clean=quit_ok, claude_rows_before=before.get("claude_rows"),
+              claude_rows_after=_claude_rows(d))
+    if not meta.get("session_present"):
+        log_event("identity-stale", account=account, phase="after-refresh")
+    meta["moved_hours"] = moved
+    meta["before"] = chrome_time_str(b)
+    return meta
+
+
+def refresh_summary(meta):
+    if not meta.get("session_present"):
+        return f"NO live sessionKey after the refresh (was {meta.get('before')}): sign in again with template identity login"
+    mv = meta.get("moved_hours")
+    how = "unchanged" if mv == 0 else (f"moved {mv:+} h" if mv is not None else "?")
+    return f"sessionKey expiry {meta.get('before')} → {meta.get('expires')} ({how})"
+
+
+def identity_accounts(which, all_, need_main=False, need_identity=False):
+    if all_:
+        out = known_accounts()
+        if need_main:
+            out = [a for a in out if main_chrome_profile_for(a)]
+        if need_identity:
+            out = [a for a in out if identity_status(a)["exists"]]
+        return out
+    if not which:
+        die("name an account or pass --all")
+    return [check_name("account", which)]
+
+
+def cmd_identity_seed(account, all_):
+    """One-time migration: graft the account's claude.* cookies from its
+    main-Chrome profile into its golden identity (created fresh if missing)."""
+    rc = 0
+    if not grafter_ok():
+        die(f"chrome-cookie-graft not found ({GRAFTER})")
+    for a in identity_accounts(account, all_, need_main=True):
+        src, src_db = main_profile_cookies(a)
+        if not src:
+            print(f"identity {a}: SKIPPED — no main-Chrome profile mapped (config `accounts`); "
+                  f"use  claude-browser template identity login {a}")
+            rc = 2
+            continue
+        if not src_db or not _db_has_claude_session(src_db):
+            print(f"identity {a}: SKIPPED — {src} in main Chrome has no live claude.ai session; "
+                  f"use  claude-browser template identity login {a}")
+            rc = 2
+            continue
+        with slot_lock():
+            d, created = ensure_identity(a)
+            if identity_open(d):
+                print(f"identity {a}: REFUSED — {d} is open in Chrome; quit it (or wait for the refresh) first")
+                rc = 1
+                continue
+            ok, last = _graft_claude(MAIN_CHROME, src, d)
+            meta = identity_record(a, seeded_at=time.strftime("%Y-%m-%d %H:%M:%S"), seeded_ts=time.time(),
+                                   source=f"main-chrome:{src}")
+        log_event("identity-seed", account=a, source=src, ok=ok, created=created,
+                  session=meta.get("session_present"), expires=meta.get("expires"))
+        print(f"identity {a}: {'seeded' if ok else 'FAILED'} from {src}{' (new identity)' if created else ''}: {last}")
+        print(f"  sessionKey present={meta.get('session_present')} expires={meta.get('expires')}  {d}")
+        rc = rc or (0 if ok and meta.get("session_present") else 3)
+    return rc
+
+
+def cmd_identity_refresh(account, all_, if_older_than=None):
+    rc = 0
+    for a in identity_accounts(account, all_, need_identity=True):
+        st = identity_status(a)
+        if not st["exists"]:
+            print(f"identity {a}: SKIPPED — none (claude-browser template identity seed|login {a})")
+            rc = 2
+            continue
+        if if_older_than is not None and st["age_hours"] is not None and st["age_hours"] < if_older_than:
+            print(f"identity {a}: fresh ({st['age_hours']} h < {if_older_than} h), not refreshed")
+            continue
+        with slot_lock():
+            before, why = identity_refresh_begin(a)
+        if not before:
+            print(f"identity {a}: SKIPPED — {why}")
+            rc = rc or 1
+            continue
+        print(f"identity {a}: launched hidden on claude.ai; quitting it in {int(IDENTITY_REFRESH_SECONDS)} s")
+        meta = identity_refresh_finish(a, before, IDENTITY_REFRESH_SECONDS)
+        print(f"identity {a}: refreshed {meta.get('refreshed_at')}; {refresh_summary(meta)}")
+        rc = rc or (0 if meta.get("session_present") else 3)
+    return rc
+
+
+def cmd_identity_login(account, wait=600):
+    """Recovery when a golden login lapses: open the identity visibly at
+    claude.ai/login; a human signs in; the new sessionKey is recorded."""
+    check_name("account", account)
+    with slot_lock():
+        d, created = ensure_identity(account)
+        if identity_open(d):
+            die(f"{d} is already open in Chrome; quit it first")
+        # A live login that was there before must change to count; an identity
+        # this call just created holds none, whatever any check says.
+        had, exp0 = (False, None) if created else _db_session_expiry(cookies_db(d))
+        _mark_identity_chrome(account, "login")
+        if not launch_identity(d, "https://claude.ai/login", hidden=False):
+            die("Chrome did not start", 3)
+    log_event("identity-login-start", account=account, had_session=had, created=created)
+    print(f"""Opened "{account} · claude.ai identity" at claude.ai/login.
+HUMAN STEP: sign in to claude.ai as {account} in that window. It closes by itself once the
+login is saved (already signed in? quit it with Cmd-Q). Waiting up to {wait}s…""")
+    t0 = time.time()
+    got = False
+    while time.time() - t0 < wait:
+        if not chrome_pids(d):
+            break                                   # the human quit it
+        if (_db_has_claude_session(cookies_db(d)) if not had
+                else _db_session_expiry(cookies_db(d))[1] not in (None, exp0)):
+            got = True
+            time.sleep(5)                           # let Chrome flush the rest of the login
+            break
+        time.sleep(2)
+    quit_identity(d)
+    with slot_lock():
+        now = {"refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"), "refreshed_ts": time.time()}
+        if not (read_json(identity_meta_path(account), {}) or {}).get("seeded_at"):
+            now.update(seeded_at=now["refreshed_at"], seeded_ts=now["refreshed_ts"])
+        meta = identity_record(account, source="login", chrome_owner_pid=None, chrome_started_ts=None,
+                               chrome_purpose=None, **now)
+    log_event("identity-login", account=account, new_session=got, session=meta.get("session_present"),
+              expires=meta.get("expires"), waited_s=round(time.time() - t0))
+    if not meta.get("session_present"):
+        log_event("identity-stale", account=account, phase="after-login")
+        print(f"identity {account}: NO live claude.ai sessionKey saved; run this again")
+        return 3
+    print(f"identity {account}: sessionKey present, expires {meta.get('expires')}"
+          + ("" if got else " (unchanged: no new sign-in seen)"))
+    return 0
+
+
+def reap_identity_orphans():
+    """Quit an identity Chrome whose recorded starter is gone and that has been
+    open longer than a refresh plus a margin; clear stale marks."""
+    n = 0
+    for a in known_accounts():
+        d = identity_dir(a)
+        meta = read_json(os.path.join(d, "identity.json"), {}) or {}
+        pid = meta.get("chrome_owner_pid")
+        if not pid or _owner_running(pid):
+            continue
+        age = time.time() - (meta.get("chrome_started_ts") or 0)
+        if identity_open(d):
+            if age < IDENTITY_REFRESH_SECONDS + ORPHAN_MARGIN_S:
+                continue
+            clean = quit_identity(d)
+            log_event("identity-orphan-quit", account=a, purpose=meta.get("chrome_purpose"),
+                      owner_pid=pid, age_s=round(age), quit_clean=clean)
+            print(f"gc: identity {a}: quit an orphaned {meta.get('chrome_purpose')} Chrome "
+                  f"(starter {pid} gone, open {round(age)} s)")
+            n += 1
+        with slot_lock():
+            _unmark_identity_chrome(a)
+    return n
+
+
+def gc_identity():
+    """One golden identity per `gc` run, the longest unrefreshed one that is
+    due, so a run stays short. Ordering against `up`: the decision and the
+    hidden launch happen under slot_lock, and an account whose agent browser
+    is mid-launch (claimed, not yet started: when `up` grafts from the
+    identity) is skipped; the identity_refresh_seconds wait and the quit run
+    outside the lock, so `up` is never blocked for long. An `up` that runs
+    during the wait grafts from a copy of the open identity's DB: whatever
+    Chrome has written to disk by then. Orphaned identity Chromes are
+    quit first, whatever identity_refresh_hours says."""
+    reap_identity_orphans()
+    if not IDENTITY_REFRESH_HOURS:
+        return 0
+    due = []
+    for a in known_accounts():
+        st = identity_status(a)
+        if st["exists"] and st["session"] and (st["age_hours"] is None or st["age_hours"] >= IDENTITY_REFRESH_HOURS):
+            due.append((-(st["age_s"] if st["age_s"] is not None else 1e12), a))   # oldest first
+    if not due:
+        return 0
+    before = acct = None
+    with slot_lock():
+        for _, a in sorted(due):
+            before, why = identity_refresh_begin(a)
+            if before:
+                acct = a
+                break
+            print(f"gc: identity {a} skipped ({why})")
+    if not before:
+        return 0
+    meta = identity_refresh_finish(acct, before, IDENTITY_REFRESH_SECONDS)
+    print(f"gc: identity {acct} refreshed; {refresh_summary(meta)}")
+    return 1
 
 
 RELAY_SECONDS = 240     # a fresh browser registers on the relay within ~1–4 min (observed)
@@ -1220,7 +2021,8 @@ def cmd_up(args):
     check_name("account", account)
     st = template_status(account)
     if not st.get("ready"):
-        die(f"template {account} is not ready (claude-browser template check {account})", 2,
+        why = base_not_ready_reasons(st["base"]) + ([] if st["device_id"] else [f"no pairing for {account}"])
+        die(f"template {account} is not ready: {'; '.join(why)} (claude-browser template check {account})", 2,
             account=account, session=session)
     purpose = (args.purpose or "").strip()
     if not PURPOSE_RE.match(purpose):
@@ -1561,17 +2363,24 @@ def cmd_events(since_hours, as_json):
 def cmd_gc(older_than):
     n = 0
     live_apps = {m.get("app") for m in instances() if m.get("app")}
+    mine = set(_dock_apps())
     if os.path.isdir(INSTANCE_APPS):
         for a in os.listdir(INSTANCE_APPS):
             p = os.path.join(INSTANCE_APPS, a)
+            if p not in mine:
+                continue            # not created by this root: another root's (possibly live) app
             # skip apps under 10 min old: a concurrent `up` may still be building it
             try:
                 young = time.time() - os.path.getmtime(p) < 600
             except OSError:
                 continue
-            if p.endswith(".app") and p not in live_apps and not young:
+            if p.endswith(".app") and p not in live_apps and not young and inside(p, INSTANCE_APPS):
                 shutil.rmtree(p, ignore_errors=True)
                 print(f"gc: orphan dock app {a}")
+    if mine:
+        still = sorted(x for x in mine if os.path.isdir(x))
+        if len(still) != len(mine):
+            write_json(DOCK_APPS, still)
     with slot_lock():
         prune_attachments()
         for m in instances():
@@ -1581,6 +2390,7 @@ def cmd_gc(older_than):
                 n += 1
                 print(f"gc: {m['session']} ({why})")
     print(f"gc: {n} removed")
+    gc_identity()
     return 0
 
 
@@ -1681,12 +2491,29 @@ def main():
 
     t = sub.add_parser("template", help="the shared base and per-account pairing overlays")
     ts = t.add_subparsers(dest="tcmd")
-    ts.add_parser("init", help="create the shared base (one human click: Add to Chrome)")
+    ti = ts.add_parser("init", help="create the shared base (one human click: Add to Chrome)")
+    ti.add_argument("--rebuild", action="store_true",
+                    help="build a new base from an empty dir and swap it in (clears any cookie the old base holds)")
+    ti.add_argument("--with", dest="with_exts", action="append", default=[], metavar="EXT_ID",
+                    help="with --rebuild: another Web Store extension to add (repeatable), e.g. a password manager")
+    ti.add_argument("--wait", type=int, default=900)
+    ae = ts.add_parser("add-extension", help="add a Web Store extension to the base (one human click), e.g. a password manager")
+    ae.add_argument("extension_id")
+    ae.add_argument("--wait", type=int, default=900)
     ts.add_parser("check").add_argument("account")
     ts.add_parser("list")
     pr = ts.add_parser("pair", help="add an account: clone base, sign in from main Chrome, human clicks the extension once; saves the overlay")
     pr.add_argument("account")
     pr.add_argument("--wait", type=int, default=600)
+    idp = ts.add_parser("identity", help="the golden claude.ai login per account (templates/<account>/identity/)")
+    ids = idp.add_subparsers(dest="icmd")
+    i1 = ids.add_parser("seed", help="copy the account's claude.ai login from its main-Chrome profile (one-time migration)")
+    i1.add_argument("account", nargs="?"); i1.add_argument("--all", action="store_true")
+    i2 = ids.add_parser("refresh", help="open the identity hidden on claude.ai for identity_refresh_seconds, then quit")
+    i2.add_argument("account", nargs="?"); i2.add_argument("--all", action="store_true")
+    i2.add_argument("--if-older-than", type=float, metavar="HOURS", help="skip identities refreshed more recently")
+    i3 = ids.add_parser("login", help="open the identity at claude.ai/login for a human to sign in")
+    i3.add_argument("account"); i3.add_argument("--wait", type=int, default=600)
 
     u = sub.add_parser("up", help="attach this session to its account's browser (launching it if needed)")
     u.add_argument("--account")
@@ -1739,7 +2566,13 @@ def main():
             return cmd_app_check()
         app.print_help(); return 1
     if args.cmd == "template":
+        if args.tcmd == "add-extension":
+            return cmd_template_add_extension(args.extension_id, args.wait)
         if args.tcmd == "init":
+            if args.rebuild:
+                return cmd_template_rebuild(args.with_exts, args.wait)
+            if args.with_exts:
+                die("--with goes with --rebuild (or use template add-extension <id>)")
             return cmd_template_init()
         if args.tcmd == "check":
             return cmd_template_check(args.account)
@@ -1747,6 +2580,14 @@ def main():
             return cmd_template_list()
         if args.tcmd == "pair":
             return cmd_template_pair(args.account, args.wait)
+        if args.tcmd == "identity":
+            if args.icmd == "seed":
+                return cmd_identity_seed(args.account, args.all)
+            if args.icmd == "refresh":
+                return cmd_identity_refresh(args.account, args.all, args.if_older_than)
+            if args.icmd == "login":
+                return cmd_identity_login(args.account, args.wait)
+            idp.print_help(); return 1
         t.print_help(); return 1
     if args.cmd == "up":
         return cmd_up(args)

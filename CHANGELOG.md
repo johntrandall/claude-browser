@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0 — 2026-10-06
+
+- **Golden identity per account.** The claude.ai login now lives in `templates/<account>/identity/`, a user-data-dir owned by claude-browser. It is created fresh (an empty directory Chrome builds its own profile in, never a copy of the base), so it inherits no cookie or pairing. It is a full Chrome profile and may hold other sites' cookies from a human sign-in; only the `claude_hosts` cookies are ever copied out of it. It is never paired, attached or listed, and it runs only briefly. `up` and `template pair` copy the claude.* cookies from it, so the per-account main-Chrome profiles are no longer needed and can be removed. An account without an identity falls back to its main-Chrome profile, and `up` says which source it used.
+- `template identity seed <account>|--all`: create the identity and copy the login from the account's main-Chrome profile (the one-time migration). Refused while the identity is open.
+- `template identity refresh <account>|--all [--if-older-than H]`: open the identity hidden (stock Chrome, extensions disabled) on claude.ai for `identity_refresh_seconds` (default 90), quit it, and log `identity-refresh` with the `sessionKey` expiry before and after (`identity-stale` when there is none). Whether this extends the login is not assumed; the events record what happened.
+- `template identity login <account>`: sign in to claude.ai in the identity's own window, the recovery path when a login lapses.
+- `gc` refreshes at most one identity per run, the one longest past `identity_refresh_hours` (default 24, `0` disables). It decides and launches under the `up` lock and skips an account whose agent browser is mid-launch; the wait runs outside the lock.
+- `template list` / `template check` show each identity: session present, expiry date, last refresh, source.
+- `gc` quits an identity Chrome whose starter died (recorded in `identity.json` before launch) once it has been open longer than a refresh plus a minute.
+- A session counts as live only for a `sessionKey` on exactly `claude.ai` / `.claude.ai` that has not expired.
+- **The base must hold no Claude cookie.** `template list` / `check` report `stray_cookies` (Claude-host rows / sessionKey rows, counted from host and name only). A base with any is not ready, and `up` / `template pair` refuse it, because every clone starts with the base's cookies. A base built before 0.3.0 may hold a login this way; rebuild it.
+- `template init --rebuild [--with <id> ...]`: build a new base from an empty directory, add the Claude extension and each `--with` extension in its window, verify it (extensions installed, no pairing, no Claude cookie), and swap it in under the lock, rolling back if the swap fails. The old base stays if verification fails.
+- `template add-extension <id>`: add a Web Store extension (e.g. a password manager) to the shared base with one human click; the new base is built beside the old one, verified the same way, and swapped in under the lock. Only one `add-extension` / `init --rebuild` runs at a time, and a `_base.new` that is a symlink or a file is refused.
+- `template pair` clones the base under the lock.
+- An account in config `accounts` may map to `{}` (no main-Chrome profile).
+- gc removes only Dock apps its own root created (recorded in `dock-apps.json`). Before, a second root sharing `apps_dir` (a test root, say) could delete another root's live Dock app. Dock apps created by 0.2.x are not in `dock-apps.json`, so gc no longer removes them; their browser's teardown still does, and an orphaned one can be deleted by hand from `~/Applications/Chrome Claude Instances/`.
+
+- The base check refuses login cookies (claude.ai sessionKey and friends, Google sign-in cookies) and any site outside what a fresh install leaves (Web Store, Google consent, captcha, anonymous claude.ai), naming them.
+
 ## 0.2.3 — 2026-10-06
 
 - `attach --device-id` and a PostToolUse hook on `select_browser` (`hooks/claude-browser-select-attach.sh`): a session that selects an agent browser without `up` is attached, so it appears on the card and in `list` and is counted by the last-out teardown. Hooks honor `CLAUDE_BROWSER_BIN`.

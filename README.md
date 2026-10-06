@@ -8,7 +8,7 @@ One throwaway Chrome per Claude account on macOS, shared by every Claude Code ag
 
 `claude-browser up` clones a prepared Chrome user-data-dir in milliseconds, using APFS copy-on-write. It copies cookies into the clone before Chrome opens it:
 
-- the claude.ai session, from that Claude account's own profile in your main Chrome
+- the claude.ai session, from that Claude account's golden identity (a small user-data-dir claude-browser keeps per account; without one, from the account's own profile in your main Chrome)
 - cookies for the hosts named in `--sites`, from your everyday profile
 
 It then launches the clone as a separate Chrome process and prints the extension's device id. The agent selects that id with `select_browser`. A second agent on the same account runs the same `up` and attaches to the running browser; the Claude in Chrome extension gives each agent its own tab group, which keeps their tabs apart (an organizational split, not a security boundary: see the security model). When a Claude Code session ends, a hook detaches it; the last agent out kills the browser and deletes its directory.
@@ -34,7 +34,7 @@ It wraps [`chrome-cookie-graft`](https://github.com/johntrandall/chrome-cookie-g
 
 - macOS on an APFS volume (instances are `cp -c` clones)
 - Google Chrome, plus the [Claude in Chrome](https://chromewebstore.google.com/detail/fcoeoabgfenejglbffodgkkbkcdhcgfn) extension
-- one or more Claude accounts, each signed in to claude.ai in a profile of your main Chrome
+- one or more Claude accounts. Each is signed in to claude.ai once: either in a profile of your main Chrome, which is then copied in, or in the account's own identity window
 - `python3` (3.9 or later, standard library only)
 - [`chrome-cookie-graft`](https://github.com/johntrandall/chrome-cookie-graft), installed by the formula
 - optional: [`fileicon`](https://github.com/mklement0/fileicon), for per-instance Dock icons (installed by the formula)
@@ -70,12 +70,12 @@ On Intel Macs the prefix is `/usr/local` instead of `/opt/homebrew`. Without the
 
 ## Quick start
 
-**1. Map each Claude account to the main-Chrome profile signed in to it.** The profile directory names are listed in `chrome://version` ("Profile Path") or under `~/Library/Application Support/Google/Chrome/`.
+**1. Name your accounts.** If a main-Chrome profile is already signed in to an account, map the account to it; its claude.ai login can then be copied in (step 3). The profile directory names are listed in `chrome://version` ("Profile Path") or under `~/Library/Application Support/Google/Chrome/`. An account you will sign in to in its own window (step 3) maps to `{}`.
 
 ```bash
 mkdir -p ~/.config/claude-browser
 cat > ~/.config/claude-browser/config.json <<'EOF'
-{ "accounts": { "work": "Profile 3", "personal": "Profile 5" } }
+{ "accounts": { "work": "Profile 3", "personal": {} } }
 EOF
 ```
 
@@ -85,7 +85,21 @@ EOF
 claude-browser template init
 ```
 
-**3. Pair each account, once.** This needs one human click per account. A clone of the base opens, signed in to claude.ai as that account. Click the Claude extension icon in its toolbar. The tool saves the resulting pairing and closes the window.
+**3. Give each account its golden identity, once.** This is the account's claude.ai login, kept in its own small user-data-dir (`templates/<account>/identity/`). Copy it from the mapped main-Chrome profile:
+
+```bash
+claude-browser template identity seed work
+```
+
+Or sign in by hand, for an account with no main-Chrome profile. A window opens at claude.ai/login; sign in, and it closes by itself once the login is saved:
+
+```bash
+claude-browser template identity login personal
+```
+
+After this, claude-browser no longer needs the main-Chrome profiles for the claude.ai login. An account without an identity keeps using its main-Chrome profile, as before.
+
+**4. Pair each account, once.** This needs one human click per account. A clone of the base opens, signed in to claude.ai as that account. Click the Claude extension icon in its toolbar. The tool saves the resulting pairing and closes the window.
 
 ```bash
 claude-browser template pair work
@@ -93,11 +107,12 @@ claude-browser template list
 ```
 
 ```text
-base       ext=True open=False extensions=1 stray_pairing=None  …/Chrome-Claude/templates/_base
+base       ext=True open=False extensions=1 stray_pairing=None stray_cookies=0/0  …/Chrome-Claude/templates/_base
 work       ready=True  slots=1 [1=a1b2c3d4]  main_profile=Profile 3 session=True
+           identity: session=True expires=2026-11-05 refreshed=never source=main-chrome:Profile 3
 ```
 
-**4. In an agent session, launch the browser.** The agent declares a purpose and the sites whose cookies it needs:
+**5. In an agent session, launch the browser.** The agent declares a purpose and the sites whose cookies it needs:
 
 ```bash
 claude-browser up --account work --purpose tickets --sites example.com
@@ -107,7 +122,7 @@ claude-browser up --account work --purpose tickets --sites example.com
 up: account=work purpose=tickets session=7f3e9a10-… from=tmux:%3 sites=example.com
   cloned  …/Chrome-Claude/sessions/acct-work
   graft: …
-  identity: from Profile 3: …
+  identity: from golden identity (sessionKey expires 2026-11-05): …
   dock app: WO agents work acct-wor.app
   launched pid 41733 window 'work · agents'
   device id a1b2c3d4-…
@@ -123,10 +138,11 @@ The agent then calls `select_browser` with that id and works in its own tabs, cl
 ```text
 templates/_base/          Chrome skeleton + Claude extension, no identity (shared, ~175 MB)
 templates/<account>/      the account's pairing: the extension's local storage (~500 KB)
+templates/<account>/identity/   the account's golden claude.ai login (a fresh Chrome profile, never paired)
         │  cp -Rc (APFS clone) + pairing, under a lock (a concurrent up waits, then attaches)
         ▼
 sessions/acct-<account>/  the account's shared user-data-dir; instance.json lists attached agents
-        │  1. graft claude.* cookies from the account's main-Chrome profile
+        │  1. graft claude.* cookies from the golden identity (else the account's main-Chrome profile)
         │  2. graft cookies for --sites hosts from the site-cookie source profile
         │  3. name the profile, write the instance card, build the Dock app
         │  4. open -na <Chrome copy> --args --user-data-dir=<dir>
@@ -138,33 +154,45 @@ SessionEnd hook → claude-browser down <session>  (detach; last one out: kill +
 
 All state lives under the root, `~/Library/Application Support/Chrome-Claude/` by default. That includes `events.log`, an append-only JSONL record of every launch, attach, detach, refusal, pairing and teardown. Instances delete themselves, so the log is the durable trace. Other tools, such as a PreToolUse hook that guards browser tools, may append their own rows. `events` shows them, and it shortens a `whoami` field of the form `<label> : <email>  <uuid>` to the email.
 
-The extension signs in off the claude.ai session cookie in its profile. Its pairing state lives in the account's saved pairing (see the security model). That cookie is re-copied at every launch from the account's main-Chrome profile, so a clone's session is as fresh as the one you use.
+The extension signs in off the claude.ai session cookie in its profile. Its pairing state lives in the account's saved pairing (see the security model).
+
+**Where the claude.ai login comes from.** That cookie is re-copied at every launch from the account's **golden identity**, `templates/<account>/identity/`. This is a user-data-dir of its own, created fresh: an empty directory that Chrome builds its own profile in, so it inherits nothing from the base. It is a full Chrome profile. Besides the claude.ai login it may hold other sites' cookies, for example from a Google sign-in a human used in its login window, or set while claude.ai loads. Those never reach agent browsers: the copy out of the identity takes only the `claude_hosts` cookies. It is never paired, attached or listed as a browser, and most of the time it is not running. `template identity seed` fills it from the account's main-Chrome profile; `template identity login` lets a human sign in to it. `identity.json` in it records when it was seeded and refreshed, its source, and the `sessionKey` cookie's expiry (read from the metadata column; the value is never read). An account without a golden identity gets the cookie from its main-Chrome profile, as in 0.2. `up` prints which source it used.
+
+**How it stays fresh.** `gc` (every 15 minutes under `brew services`) refreshes at most one identity per run: the one longest unrefreshed, once that is longer than `identity_refresh_hours`. A refresh opens the identity hidden (`open -g -j`, stock Chrome, extensions disabled) on claude.ai for `identity_refresh_seconds`. It then quits it and logs an `identity-refresh` event with the expiry before and after (`identity-stale` when no `sessionKey` is left). Whether loading claude.ai moves that expiry forward is not assumed; the events show what happened. Each identity Chrome's starter (process and start time) is recorded before it launches, so `gc` quits one whose starter died (a `gc` killed mid-wait, say) once it has been open longer than a refresh.
+
+**How a refresh and `up` stay apart.** The refresh decides and launches under the same lock `up` uses, and it skips an account whose agent browser is mid-launch: that is when `up` copies from the identity. The wait runs outside the lock, so an `up` during it is not blocked. It copies whatever login Chrome has written to disk at that moment.
 
 ## Security model
 
-- **What moves.** Two sets of cookies are copied into a clone, and nothing else. The first is the `claude.ai` / `claude.com` / `claudeusercontent.com` cookies from that account's own main-Chrome profile. `anthropic.com` is left out by default, because its Console session can create API keys. The second is cookies for each `--sites` host and its subdomains, from the site-cookie source profile (`Default` unless configured). A site is a plain hostname such as `example.com` (it covers its subdomains too) or a single host name such as `nas` (that exact host only). Wildcards, Claude and Anthropic hosts, and a short list of public suffixes such as `com` or `co.uk` are refused. The suffix list is not complete, so use `allowed_sites` for a real fence. `up` refuses to launch without `--sites` unless you pass `--no-graft`.
-- **What is kept at rest.** Each account's saved pairing (`templates/<account>/`) is the Claude extension's complete local storage after pairing. That includes its device id and its authorization state, which may include tokens. It persists until you delete it, and it is copied into every browser of that account. It is protected only by the permissions of your user account's `~/Library`, the same as Chrome's own profiles.
+- **What moves.** A clone starts with the base's own cookies: only what a fresh extension install leaves (Web Store, Google consent, captcha, anonymous claude.ai). `template check` refuses a base holding any login or any other site's cookies. Two more sets are copied in, and nothing else. The first is the `claude.ai` / `claude.com` / `claudeusercontent.com` cookies from that account's golden identity (or, without one, its own main-Chrome profile). `anthropic.com` is left out by default, because its Console session can create API keys. The second is cookies for each `--sites` host and its subdomains, from the site-cookie source profile (`Default` unless configured). A site is a plain hostname such as `example.com` (it covers its subdomains too) or a single host name such as `nas` (that exact host only). Wildcards, Claude and Anthropic hosts, and a short list of public suffixes such as `com` or `co.uk` are refused. The suffix list is not complete, so use `allowed_sites` for a real fence. `up` refuses to launch without `--sites` unless you pass `--no-graft`.
+- **What is kept at rest.** Each account's saved pairing (`templates/<account>/`) is the Claude extension's complete local storage after pairing. That includes its device id and its authorization state, which may include tokens. It persists until you delete it, and it is copied into every browser of that account. It is protected only by the permissions of your user account's `~/Library`, the same as Chrome's own profiles. Each account's golden identity (`templates/<account>/identity/`) holds that account's claude.ai session cookies at rest, and possibly other sites' cookies from a human sign-in there. They are protected as Chrome's own profiles are, and no more: Chrome encrypts the cookie values with the login-Keychain key ("Chrome Safe Storage") and writes the Cookies file user-only (0600); the identity directory is created user-only (0700), and `~/Library` is user-only by default. That keeps out other users of the Mac. It does not keep out programs running as you, which can read the files and ask the Keychain for the key.
 - **Where it moves.** Only between directories on the same Mac. Nothing is uploaded. chrome-cookie-graft decrypts and re-encrypts with the same login-Keychain key Chrome uses ("Chrome Safe Storage").
 - **How long it lives.** A browser is deleted, not trashed, when its last agent detaches through `down` or the SessionEnd hook. Failing those, `gc` or the next `up` detaches agents whose process has exited, and reaps a browser when its Chrome is gone, every agent's process has exited (`owner-gone`), no agent is attached, or it has been idle for `idle_minutes` (default 120) with no attached agent holding it (`up --hold`). `brew services start claude-browser` runs `gc` every 15 minutes.
 - **Agents on one account share one browser profile.** Cookies, localStorage, IndexedDB and history are shared by every agent attached to an account's browser. One agent can use a site another agent asked for, or one you logged in to in that window, and can open `chrome://history` or another agent's logged-in site. Tab groups keep tabs apart for tidiness; they are not a security boundary. If agents need isolation from each other, run them under different Claude accounts.
 - **What an agent can do.** A launched browser is a real signed-in browser for the grafted sites. The agent chooses `--sites` itself, so this scoping protects against mistakes, not against a compromised or prompt-injected agent. To fence what any agent can request, set `allowed_sites` and/or `denied_sites` in the config. `up` enforces both. The fence holds only if the agent cannot edit the config file or set `CLAUDE_BROWSER_CONFIG`. The same file's `account_detector` and `origin_command` are shell commands.
 - **What the CLI will delete.** Session ids and account names must be plain names (letters, digits, `.`, `_`, `-`; session ids lowercase). Teardown deletes a directory only after resolving it to a direct child of `sessions/`, and it stops only processes whose command line carries exactly that instance's `--user-data-dir`.
-- **What stays untouched.** Your main Chrome's profiles are only read. The base template never holds an identity: `template list` reports `stray_pairing`, and that value must be `None`.
+- **Extensions added to the base run in every agent browser.** `template add-extension` puts an extension, and whatever setup you did in its window, into every browser launched afterwards. Example: a password manager connected to its desktop app. With a password manager there, any agent browser can fill logins while the desktop app is unlocked. In one test, an agent could not open or operate the password manager's in-page menu. That is a single observation, not a guarantee. A password manager in the base can fill on any site, so it defeats the `--sites` / `allowed_sites` fence: that fence limits which cookies are copied in, not which sites an agent can sign in to with saved logins.
+- **What stays untouched.** Your main Chrome's profiles are only read: by `template identity seed`, and by `up` / `template pair` for an account with no golden identity. The base template never holds an identity: `template list` reports `stray_pairing`, which must be `None`, and `stray_cookies` (Claude-host rows / sessionKey rows), which must be `0/0`. Every clone starts with the base's cookies, so a base with a Claude cookie is not ready: rebuild it with `template init --rebuild`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `template init` | Create the shared base; needs one human click (Add to Chrome) |
+| `template init --rebuild [--with <id> ...]` | Build a new base from an empty directory (not a copy, so it inherits no cookie or login), add the Claude extension and each `--with` extension in its window, do any extension setup, quit. It is verified (every extension installed, no pairing, no Claude cookie) and swapped in under the lock; otherwise the old base stays |
+| `template add-extension <id>` | Add a Web Store extension (for example a password manager) to the base; one human click. Browsers launched afterwards include it. Only one `add-extension` / `init --rebuild` runs at a time |
 | `template pair <account>` | Pair (or re-pair) an account; one human click on the extension icon |
-| `template check <account>` / `template list` | Report whether the base and the pairing are ready |
+| `template check <account>` / `template list` | Report whether the base, the pairing and the golden identity are ready |
+| `template identity seed <account>` / `--all` | Create the account's golden identity and copy its claude.ai login from the mapped main-Chrome profile. Refused while the identity is open |
+| `template identity refresh <account>` / `--all` `[--if-older-than H]` | Open the identity hidden on claude.ai for `identity_refresh_seconds`, quit it, record the `sessionKey` expiry before and after |
+| `template identity login <account> [--wait S]` | Open the identity at claude.ai/login for a human to sign in; it closes once a new login is saved |
 | `up --purpose W --sites H[,H] [--account A] [--session S] [--origin T] [--no-graft] [--hold MIN] [--wait S]` | Attach this session to its account's browser, launching it if needed. `--hold` keeps it past the idle limit while waiting on a human |
 | `down [<session>] [--all]` | Detach a session; the last one out kills the browser and deletes it. `down acct-<account>` or `--all` kills a browser no matter how many agents are attached |
 | `list [--json]` | List browsers and their attached agents: purpose, owner alive, origin, sites; idle minutes, device id |
 | `resolve <device-id>` | Answer "whose browser is this?" |
 | `attach --device-id ID [--session S] [--purpose P]` | Attach a session to the agent browser with that device id (used by the `select_browser` hook) |
 | `events [--since H] [--json]` | Print the event log |
-| `gc [--older-than H]` | Detach dead agents; remove dead, abandoned, idle or old browsers and orphaned Dock apps |
+| `gc [--older-than H]` | Detach dead agents; remove dead, abandoned, idle or old browsers and orphaned Dock apps; refresh at most one golden identity that is due |
 | `app build [--account A \| --all]` / `app check` | Manage the icon-bearing Chrome copies; rebuild after a Chrome update |
 | `config [--json]` | Print the effective configuration |
 
@@ -176,7 +204,7 @@ The config lives in `~/.config/claude-browser/config.json`, or wherever `$CLAUDE
 
 | Key | Default | Meaning |
 |---|---|---|
-| `accounts` | `{}` | Account name → main-Chrome profile dir, e.g. `{"work": "Profile 3"}`. The value can also be `{"profile": "Profile 3", "badge": "W"}`. |
+| `accounts` | `{}` | Account name → main-Chrome profile dir, e.g. `{"work": "Profile 3"}`. The value can also be `{"profile": "Profile 3", "badge": "W"}`, or `{}` for an account with only a golden identity. The profile is the source for `template identity seed`, and the fallback for an account with no golden identity. |
 | `registry` | none | For setups that already keep an account registry: a JSON file holding `accounts.<name>.chrome_profile_dir`. `accounts` wins on conflict. |
 | `account_detector` | none | Shell command whose stdout's first word is this session's account. Used when neither `--account` nor `$CLAUDE_BROWSER_ACCOUNT` is given. |
 | `origin_command` | none | Shell command whose first stdout line names where the agent runs. Overrides pane detection; `--origin` overrides it. |
@@ -193,6 +221,8 @@ The config lives in `~/.config/claude-browser/config.json`, or wherever `$CLAUDE
 | `grafter` | `chrome-cookie-graft` on `PATH` | Path to chrome-cookie-graft |
 | `idle_minutes` | `120` | Reap an instance after this long with no tab activity (History or session writes); `0` disables |
 | `owner_process_names` | `["claude"]` | Process names that count as the owning agent; an instance whose owner has exited is reaped |
+| `identity_refresh_hours` | `24` | `gc` refreshes a golden identity last refreshed (or seeded) longer ago than this; `0` disables |
+| `identity_refresh_seconds` | `90` | How long a refresh keeps the hidden identity Chrome open on claude.ai before quitting it |
 
 The account is resolved in this order:
 
@@ -217,6 +247,7 @@ If none of these yields an account, `up` refuses. Once a session has a running i
 - **Tab pinning is human-only.** Chrome keeps pinned tabs and startup pages in HMAC-tracked preferences and discards outside writes. The instance card is marked by its favicon and title instead.
 - **Local native messaging fails from app copies.** An instance launched from a relocated copy of Chrome cannot find the user-level native messaging hosts, even with the symlink. The relay path that `list_connected_browsers` uses does not depend on them.
 - **Two connected browsers block the tools until one is selected.** When two browsers are connected to the same account (for example the agent browser and that account's profile in your main Chrome) and none is selected, claude-in-chrome tools refuse until `select_browser` runs. Agents should select the id that `up` printed before doing anything else.
+- **A refresh is not proven to extend the login.** A refresh loads claude.ai with the saved login and records the `sessionKey` expiry before and after. Whether claude.ai moves it forward has not been established. If an identity goes stale (`identity-stale` in `events`, `session=False` in `template list`), run `template identity login <account>`.
 - **Agents close their own tabs.** The tool cannot close another agent's tab group from outside Chrome, so a detaching agent should close its tabs first; its leftover tabs go away with the browser.
 
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
