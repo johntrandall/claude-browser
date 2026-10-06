@@ -61,7 +61,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -1370,6 +1370,44 @@ def instances():
     return out
 
 
+def cmd_attach(device, session=None, purpose=None):
+    """Attach a session to the agent browser that owns DEVICE id, for agents
+    that reached it with select_browser instead of `up` (a subagent handed the
+    id, say). Meant for a PostToolUse hook on select_browser: then every agent
+    driving a shared browser is on its card, in `list`, and counted by the
+    last-out teardown. Exit 0 attached or already attached; 1 not an agent
+    browser (e.g. a profile in the main Chrome)."""
+    session = session or os.environ.get("CLAUDE_SESSION_ID")
+    if not session:
+        die("which session? pass --session or export CLAUDE_SESSION_ID")
+    check_name("session", session)
+    purpose = (purpose or "selected").strip()
+    if not PURPOSE_RE.match(purpose):
+        die("--purpose must be one word (letters, digits, - or _)")
+    with slot_lock():
+        m = next((x for x in instances() if x.get("device_id") == device and x["running"]), None)
+        if not m:
+            return 1
+        if any(a.get("session") == session for a in m.get("attachments") or []):
+            print(f"claude-browser: session already attached to {m['session']}")
+            return 0
+        att = {"session": session, "purpose": purpose, "sites": [], "identity": caller_identity(),
+               "owner_pid": owner_pid(), "attached_at": time.strftime("%Y-%m-%d %H:%M:%S"), "via": "select_browser"}
+
+        def add(mt):
+            if mt.get("attached") is None:
+                mt["attached"] = attachments(mt)
+            mt["attached"].append(att)
+        meta = update_meta(m["dir"], add)
+        rewrite_card(m["dir"])
+    log_event("attach", session=session, account=m.get("account"), purpose=purpose, instance=m["session"],
+              via="select_browser")
+    print(f"claude-browser: attached this session to the shared {m.get('account')} browser "
+          f"({len(meta['attached'])} agent(s)); it shares cookies with every agent there. "
+          f"Close your tab group and `claude-browser down` when done.")
+    return 0
+
+
 def cmd_list(as_json=False):
     rows = instances()
     if as_json:
@@ -1676,6 +1714,11 @@ def main():
 
     sub.add_parser("resolve", help="which session owns a device id").add_argument("device_id")
 
+    at = sub.add_parser("attach", help="attach a session to the agent browser with this device id (for a select_browser hook)")
+    at.add_argument("--device-id", required=True)
+    at.add_argument("--session")
+    at.add_argument("--purpose")
+
     g = sub.add_parser("gc", help="remove dead or old instances")
     g.add_argument("--older-than", type=float, default=24.0, help="hours")
 
@@ -1715,6 +1758,8 @@ def main():
         return cmd_list(args.json)
     if args.cmd == "resolve":
         return cmd_resolve(args.device_id)
+    if args.cmd == "attach":
+        return cmd_attach(args.device_id, args.session, args.purpose)
     if args.cmd == "gc":
         return cmd_gc(args.older_than)
     if args.cmd == "config":

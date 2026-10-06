@@ -8,7 +8,7 @@
 # never block a session from ending.
 
 # Hooks may run with a minimal PATH: try it, then the usual install locations.
-CB="$(command -v claude-browser 2>/dev/null)"
+CB="${CLAUDE_BROWSER_BIN:-$(command -v claude-browser 2>/dev/null)}"
 for c in /opt/homebrew/bin/claude-browser /usr/local/bin/claude-browser "$HOME/.local/bin/claude-browser"; do
   [ -n "$CB" ] && break
   [ -x "$c" ] && CB="$c"

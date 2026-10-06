@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3 — 2026-10-06
+
+- `attach --device-id` and a PostToolUse hook on `select_browser` (`hooks/claude-browser-select-attach.sh`): a session that selects an agent browser without `up` is attached, so it appears on the card and in `list` and is counted by the last-out teardown. Hooks honor `CLAUDE_BROWSER_BIN`.
+
 ## 0.2.2 — 2026-10-06
 
 - `up --hold <minutes>`: an agent waiting on a human (a sign-in, an approval) keeps the shared browser past the idle limit for that long (max 24 h). Re-run in the same session to extend. `list` shows the remaining hold.

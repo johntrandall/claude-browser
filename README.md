@@ -47,7 +47,11 @@ It wraps [`chrome-cookie-graft`](https://github.com/johntrandall/chrome-cookie-g
 brew install johntrandall/tap/claude-browser
 ```
 
-Then register the two hooks in `~/.claude/settings.json`. The SessionStart hook exports `CLAUDE_SESSION_ID` into the session's shell. The SessionEnd hook tears the instance down.
+Then register the three hooks in `~/.claude/settings.json`:
+
+- **SessionStart** exports `CLAUDE_SESSION_ID` into the session's shell.
+- **SessionEnd** detaches the session; the last one out tears the browser down.
+- **PostToolUse on `select_browser`** attaches a session that reached an agent browser without `up` (a subagent handed the device id, for example). Without it, that agent is missing from the card and from `list`, and the last-out teardown can kill the browser under it.
 
 ```json
 {
@@ -55,7 +59,9 @@ Then register the two hooks in `~/.claude/settings.json`. The SessionStart hook 
     "SessionStart": [{ "hooks": [{ "type": "command",
       "command": "/opt/homebrew/share/claude-browser/hooks/claude-browser-session-start.sh" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command",
-      "command": "/opt/homebrew/share/claude-browser/hooks/claude-browser-session-end.sh" }] }]
+      "command": "/opt/homebrew/share/claude-browser/hooks/claude-browser-session-end.sh" }] }],
+    "PostToolUse": [{ "matcher": "mcp__claude-in-chrome__select_browser", "hooks": [{ "type": "command",
+      "command": "/opt/homebrew/share/claude-browser/hooks/claude-browser-select-attach.sh" }] }]
   }
 }
 ```
@@ -156,6 +162,7 @@ The extension signs in off the claude.ai session cookie in its profile. Its pair
 | `down [<session>] [--all]` | Detach a session; the last one out kills the browser and deletes it. `down acct-<account>` or `--all` kills a browser no matter how many agents are attached |
 | `list [--json]` | List browsers and their attached agents: purpose, owner alive, origin, sites; idle minutes, device id |
 | `resolve <device-id>` | Answer "whose browser is this?" |
+| `attach --device-id ID [--session S] [--purpose P]` | Attach a session to the agent browser with that device id (used by the `select_browser` hook) |
 | `events [--since H] [--json]` | Print the event log |
 | `gc [--older-than H]` | Detach dead agents; remove dead, abandoned, idle or old browsers and orphaned Dock apps |
 | `app build [--account A \| --all]` / `app check` | Manage the icon-bearing Chrome copies; rebuild after a Chrome update |

@@ -63,6 +63,11 @@ print('one browser, three agents attached: yes')" || { echo "FAIL: attach bookke
 grep -q "$SESS-b" "$INST/instance-card.html" && echo "card lists the agents: yes" || { echo "FAIL: card not rewritten"; exit 1; }
 "$CB" list
 
+echo "4b. an agent that selects the browser without up is attached by the select_browser hook"
+DEV=$("$CB" list --json | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['device_id'])")
+printf '{"session_id":"%s","tool_input":{"deviceId":"%s"}}' "$SESS-sel" "$DEV" | CLAUDE_BROWSER_BIN="$CB" bash "$(dirname "$CB")/../hooks/claude-browser-select-attach.sh" | grep -q "attached this session" \
+  && "$CB" list | grep -q "$SESS-sel" && echo "select_browser hook attaches: yes" || { echo "FAIL: select hook"; "$CB" list; exit 1; }
+"$CB" down "$SESS-sel" >/dev/null
 echo "5. down detaches; the last one out tears down"
 "$CB" down "$SESS-b" | grep -q "2 agent(s) remain" && echo "detach keeps the browser: yes" || { echo "FAIL: detach"; exit 1; }
 pgrep -f -- "--user-data-dir=$INST" >/dev/null || { echo "FAIL: browser died on a detach"; exit 1; }
