@@ -61,7 +61,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -1141,6 +1141,21 @@ def refresh_claude_identity(user_data_dir, account):
     return f"from {src}: {last[0].strip()}" if r.returncode == 0 else f"FAILED from {src}: {last[0].strip()}"
 
 
+RELAY_SECONDS = 240     # a fresh browser registers on the relay within ~1–4 min (observed)
+
+
+def relay_hint(launched_at):
+    """What an agent should do right after `up`: a browser launched moments ago
+    is not on the relay yet, and select_browser fails until it is."""
+    age = time.time() - launched_at if launched_at else None
+    if age is not None and age < RELAY_SECONDS:
+        return (f"  This browser was launched {int(age)} s ago and registers on the relay within ~1–4 min.\n"
+                f"  Poll list_connected_browsers (every ~15 s, up to {RELAY_SECONDS // 60} min) until the id below is "
+                f"listed, THEN select_browser. \"No connected browser has deviceId\" before that means: keep waiting, "
+                f"you are not blocked, do not run `down`.")
+    return None
+
+
 def instance_name(account):
     return "acct-" + account.lower()
 
@@ -1238,8 +1253,11 @@ def cmd_up(args):
             dev = live.get("device_id") or device_id(live["dir"])
             log_event("attach", session=session, account=account, purpose=purpose, sites=sites,
                       instance=name, missing_sites=missing, identity=identity)
-            print(f"  attached to the running {account} browser ({len(meta['attached'])} agent(s)); "
-                  f"open your own tabs, close them when done")
+            print(f"  attached to the {account} browser ({len(meta['attached'])} agent(s)); "
+                  f"work in your own tab group and close it when done")
+            hint = relay_hint(meta.get("launched_at") or (time.time() if not meta.get("pid") else None))
+            if hint:
+                print(hint)
             if missing:
                 print(f"  NOTE: cookies for {', '.join(missing)} were not grafted (Chrome cannot take new cookies "
                       f"while running). Log in to those sites in this window if needed; the login stays for "
@@ -1273,7 +1291,7 @@ def cmd_up(args):
     if not pids:
         die("  Chrome did not start for this instance", 3)
     with slot_lock():
-        update_meta(dst, lambda mt: mt.update(pid=min(pids)))
+        update_meta(dst, lambda mt: mt.update(pid=min(pids), launched_at=time.time()))
     print(f"  launched pid {min(pids)} window '{account} · agents'")
     t_launch = time.time()
     log_event("up", session=session, account=account, purpose=purpose, sites=sites, instance=name,
@@ -1287,6 +1305,7 @@ def cmd_up(args):
         print(f"  WARNING: no bridgeDeviceId after {args.wait}s — the extension may need a human click in this window")
         return 3
     print(f"  device id {new_id}")
+    print(relay_hint(t_launch))
     print(f"NEXT (in the agent): list_connected_browsers → select_browser deviceId={new_id}")
     return 0
 

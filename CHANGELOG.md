@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-10-06
+
+- `up` tells the launching agent and every agent that attaches within the first 4 minutes that the browser is not on the relay yet: poll `list_connected_browsers` before deciding it is blocked (in a 4-agent run, 3 agents gave up on "No connected browser has deviceId" seconds after launch).
+
 ## 0.2.0 — 2026-10-06
 
 - One browser per Claude account, shared by every agent on it (each agent in its own tab group). `up` attaches to the account's running browser, or launches it; `down` detaches, and the last agent out tears the browser down. Concurrent `up` calls are serialized by a lock, so they end with one browser and all callers attached (0.1.0 could launch duplicates that fought over the relay).

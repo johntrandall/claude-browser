@@ -51,9 +51,10 @@ grep -q "\"name\"" "$INST/Default/Preferences" && echo "profile name set: yes"
   && echo "re-run up is idempotent: yes" || { echo "FAIL: re-run up was not idempotent"; exit 1; }
 
 echo "4. a second and third agent on the same account attach to the SAME browser"
-"$CB" up --account "$ACC" --session "$SESS-b" --purpose two --sites example.com --wait 2 2>&1 | grep -q "attached to the running $ACC browser" \
+"$CB" up --account "$ACC" --session "$SESS-b" --purpose two --sites example.com --wait 2 2>&1 | grep -q "attached to the $ACC browser" \
   && echo "second agent attached: yes" || { echo "FAIL: second agent did not attach"; "$CB" list; exit 1; }
-"$CB" up --account "$ACC" --session "$SESS-c" --purpose three --no-graft --wait 2 >/dev/null 2>&1
+"$CB" up --account "$ACC" --session "$SESS-c" --purpose three --no-graft --wait 2 2>&1 | grep -q "Poll list_connected_browsers" \
+  && echo "early attacher told to poll the relay: yes" || { echo "FAIL: no relay hint for an early attacher"; exit 1; }
 "$CB" list --json | python3 -c "
 import json,sys; rows=json.load(sys.stdin); acct=[m for m in rows if m['session']=='acct-$ACC']
 assert len(rows)==1 and len(acct)==1, [m['session'] for m in rows]
@@ -115,7 +116,7 @@ import json,sys; p,s=sys.argv[1],sys.argv[2]; m=json.load(open(p)); a=m.pop("att
 m.update(session=s, purpose=a["purpose"], identity=a["identity"], owner_pid=a["owner_pid"]); json.dump(m,open(p,"w"))
 EOF
 open -na "Google Chrome" --args --user-data-dir="$ROOT/sessions/$SESS-legacy" --profile-directory=Default --no-first-run about:blank; sleep 3
-"$CB" up --account "$ACC" --session "$SESS-new" --purpose new --no-graft --wait 2 2>&1 | grep -q "attached to the running"   && [ ! -d "$INST" ] && echo "legacy browser adopted, no duplicate: yes" || { echo "FAIL: legacy not adopted"; "$CB" list; exit 1; }
+"$CB" up --account "$ACC" --session "$SESS-new" --purpose new --no-graft --wait 2 2>&1 | grep -q "attached to the $ACC browser"   && [ ! -d "$INST" ] && echo "legacy browser adopted, no duplicate: yes" || { echo "FAIL: legacy not adopted"; "$CB" list; exit 1; }
 "$CB" down --all >/dev/null
 echo "11b. a 0.1.x browser with a reset (unpaired) device id is NOT adopted"
 mkdir -p "$ROOT/sessions/$SESS-unpaired/Default"

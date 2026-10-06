@@ -108,7 +108,7 @@ up: account=work purpose=tickets session=7f3e9a10-… from=tmux:%3 sites=example
 NEXT (in the agent): list_connected_browsers → select_browser deviceId=a1b2c3d4-…
 ```
 
-The agent then calls `select_browser` with that id and works in its own tabs, closing them when done. A second agent on `work` gets `attached to the running work browser` and the same device id. When a session ends, the SessionEnd hook runs `claude-browser down <session>`, which detaches it; the last one out tears the browser down.
+The agent then calls `select_browser` with that id and works in its own tabs, closing them when done. A second agent on `work` gets `attached to the work browser` and the same device id. A browser launched in the last few minutes is not on the relay yet; `up` says so, and agents poll `list_connected_browsers` until the id appears (about 1–4 minutes) before selecting it. When a session ends, the SessionEnd hook runs `claude-browser down <session>`, which detaches it; the last one out tears the browser down.
 
 **One limit of sharing:** Chrome cannot take new cookies while it runs. An agent that attaches gets the sites grafted at launch; for any of its `--sites` not covered, `up` prints a note, and the agent (or you) logs in to that site in the window. That login then lasts for the browser's lifetime.
 
