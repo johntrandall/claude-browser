@@ -70,7 +70,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -886,6 +886,7 @@ def cmd_template_add_extension(ext, wait=900):
         problems = _base_problems(new, [EXT_CLAUDE, ext])
         if problems:
             shutil.rmtree(new, ignore_errors=True)
+            log_event("base-extension-refused", extension=ext, problems=problems)
             die("nothing changed: " + "; ".join(problems), 3)
         _swap_in_base(new, exts, f"add-extension {ext}")
     log_event("base-extension-added", extension=ext)
@@ -918,6 +919,7 @@ def cmd_template_rebuild(with_exts=(), wait=900):
         problems = _base_problems(new, exts)
         if problems:
             shutil.rmtree(new, ignore_errors=True)
+            log_event("base-rebuild-refused", extensions=exts, problems=problems)
             die("the old base is unchanged: " + "; ".join(problems), 3)
         _swap_in_base(new, exts, "rebuild")
     log_event("base-rebuilt", extensions=exts)
@@ -2022,7 +2024,9 @@ def cmd_up(args):
     st = template_status(account)
     if not st.get("ready"):
         why = base_not_ready_reasons(st["base"]) + ([] if st["device_id"] else [f"no pairing for {account}"])
-        die(f"template {account} is not ready: {'; '.join(why)} (claude-browser template check {account})", 2,
+        die(f"template {account} is not ready: {'; '.join(why)} (claude-browser template check {account}).\n"
+            f"STOP here and tell the human this message. Do not select another browser instead (in particular "
+            f"not the human's own Chrome profile, which carries their live logins).", 2,
             account=account, session=session)
     purpose = (args.purpose or "").strip()
     if not PURPOSE_RE.match(purpose):

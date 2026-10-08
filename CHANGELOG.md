@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — 2026-10-08
+
+- When the template is not ready, `up` tells the agent to stop and report, never to select another browser (an agent refused for days fell back to the human's own Chrome profile).
+- A refused `template init --rebuild` logs `base-rebuild-refused` with the reasons.
+
 ## 0.3.0 — 2026-10-06
 
 - **Golden identity per account.** The claude.ai login now lives in `templates/<account>/identity/`, a user-data-dir owned by claude-browser. It is created fresh (an empty directory Chrome builds its own profile in, never a copy of the base), so it inherits no cookie or pairing. It is a full Chrome profile and may hold other sites' cookies from a human sign-in; only the `claude_hosts` cookies are ever copied out of it. It is never paired, attached or listed, and it runs only briefly. `up` and `template pair` copy the claude.* cookies from it, so the per-account main-Chrome profiles are no longer needed and can be removed. An account without an identity falls back to its main-Chrome profile, and `up` says which source it used.
