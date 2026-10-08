@@ -21,12 +21,16 @@ EXT="fcoeoabgfenejglbffodgkkbkcdhcgfn"
 COLS="creation_utc,host_key,top_frame_site_key,name,value,encrypted_value,path,expires_utc,is_secure,is_httponly,last_access_utc,has_expires,is_persistent,priority,samesite,source_scheme,source_port,last_update_utc,source_type,has_cross_site_ancestor"
 NOW_C=$(python3 -c 'import time; print(int((time.time() + 11644473600) * 1e6))'); EXP_C=$((NOW_C + 30 * 86400 * 1000000))
 
+# Every Chrome this test opens is a badged copy, like every Chrome the tool opens:
+# build the generic one into the isolated apps dir first (needs fileicon + Pillow/uv).
+"$CB" app build >/dev/null || { echo "FAIL: could not build the badged Chrome copy (fileicon, Pillow/uv?)"; exit 1; }
+APP="$TMPROOT/Applications/Chrome Claude.app"
 cleanup() { "$CB" down --all >/dev/null 2>&1 || true; pkill -f -- "--user-data-dir=$ROOT/templates/" 2>/dev/null || true; sleep 1; rm -rf "$TMPROOT"; }
 trap cleanup EXIT
 
 echo "1. build a fake base (Chrome creates the profile skeleton) + a fake overlay"
 mkdir -p "$B/Default"
-open -na "Google Chrome" --args --user-data-dir="$B" --profile-directory=Default --no-first-run --no-default-browser-check "about:blank"
+open -na "$APP" --args --user-data-dir="$B" --profile-directory=Default --no-first-run --no-default-browser-check "about:blank"
 for i in $(seq 1 20); do [ -f "$B/Default/Cookies" ] && break; sleep 1; done
 pkill -f -- "--user-data-dir=$B"; sleep 3
 [ -f "$B/Default/Cookies" ] || { echo "FAIL: no Cookies DB in fake base"; exit 1; }
@@ -132,13 +136,13 @@ python3 - "$ROOT/sessions/$SESS-legacy/instance.json" "$SESS-legacy" <<'EOF'
 import json,sys; p,s=sys.argv[1],sys.argv[2]; m=json.load(open(p)); a=m.pop("attached")[0]
 m.update(session=s, purpose=a["purpose"], identity=a["identity"], owner_pid=a["owner_pid"]); json.dump(m,open(p,"w"))
 EOF
-open -na "Google Chrome" --args --user-data-dir="$ROOT/sessions/$SESS-legacy" --profile-directory=Default --no-first-run about:blank; sleep 3
+open -na "$APP" --args --user-data-dir="$ROOT/sessions/$SESS-legacy" --profile-directory=Default --no-first-run about:blank; sleep 3
 "$CB" up --account "$ACC" --session "$SESS-new" --purpose new --no-graft --wait 2 2>&1 | grep -q "attached to the $ACC browser"   && [ ! -d "$INST" ] && echo "legacy browser adopted, no duplicate: yes" || { echo "FAIL: legacy not adopted"; "$CB" list; exit 1; }
 "$CB" down --all >/dev/null
 echo "11b. a 0.1.x browser with a reset (unpaired) device id is NOT adopted"
 mkdir -p "$ROOT/sessions/$SESS-unpaired/Default"
 echo '{"session":"'$SESS-unpaired'","account":"'$ACC'","purpose":"old"}' > "$ROOT/sessions/$SESS-unpaired/instance.json"
-open -na "Google Chrome" --args --user-data-dir="$ROOT/sessions/$SESS-unpaired" --profile-directory=Default --no-first-run about:blank; sleep 3
+open -na "$APP" --args --user-data-dir="$ROOT/sessions/$SESS-unpaired" --profile-directory=Default --no-first-run about:blank; sleep 3
 "$CB" up --account "$ACC" --session "$SESS-n2" --purpose new --no-graft --wait 2 >/dev/null 2>&1
 [ -d "$INST" ] && echo "unpaired legacy browser not adopted, fresh browser launched: yes" || { echo "FAIL: unpaired legacy adopted"; "$CB" list; exit 1; }
 "$CB" down --all >/dev/null
@@ -147,13 +151,16 @@ mkdir -p "$TMPROOT/Applications/Chrome Claude Instances/XX foreign root.app"
 touch -t 202001010000 "$TMPROOT/Applications/Chrome Claude Instances/XX foreign root.app"
 "$CB" gc >/dev/null
 [ -d "$TMPROOT/Applications/Chrome Claude Instances/XX foreign root.app" ] && echo "foreign Dock app left alone: yes" || { echo "FAIL: gc removed a foreign Dock app"; exit 1; }
+echo "13a. no stock Chrome: every claude-browser Chrome process runs from a badged copy"
+STOCK=$(ps -axww -o command= | grep -F -- "--user-data-dir=$ROOT/" | grep -c "^/Applications/Google Chrome.app/" || true)
+[ "$STOCK" = 0 ] && echo "no stock-Chrome process for this root: yes" || { echo "FAIL: $STOCK stock Chrome process(es) for this root"; exit 1; }
 echo "13. template add-extension: a new base is built beside the old one and swapped in"
 FAKEEXT=abcdefghijklmnopabcdefghijklmnop
 "$CB" template add-extension "$FAKEEXT" --wait 60 > "$TMPROOT/addext.log" 2>&1 &
 AE=$!
 for i in $(seq 1 30); do pgrep -f -- "--user-data-dir=$B.new" >/dev/null && break; sleep 1; done
 mkdir -p "$B.new/Default/Extensions/$FAKEEXT/1.0_0"          # stands in for the human's Add to Chrome
-pkill -f -- "--user-data-dir=$B.new"; wait $AE
+pkill -f -- "--user-data-dir=$B.new"; wait $AE || true
 grep -q "base now has extension $FAKEEXT" "$TMPROOT/addext.log" && [ -d "$B/Default/Extensions/$FAKEEXT" ] && [ ! -d "$B.new" ] \
   && echo "extension added to the base by swap: yes" || { echo "FAIL: add-extension"; cat "$TMPROOT/addext.log"; exit 1; }
 "$CB" template add-extension "not-an-id" >/dev/null 2>&1 && { echo "FAIL: bad extension id accepted"; exit 1; }
@@ -245,7 +252,7 @@ grep "identity:" "$TMPROOT/up.out"
 grep "identity:" "$TMPROOT/up.out" | grep -q "from golden identity.*wrote 1 rows" \
   && echo "up grafts claude.* from the golden identity: yes" || { echo "FAIL: up did not use the golden identity"; exit 1; }
 "$CB" down --all >/dev/null
-open -na "Google Chrome" --args --user-data-dir="$ID" --profile-directory=Default --no-first-run --disable-extensions about:blank
+open -na "$APP" --args --user-data-dir="$ID" --profile-directory=Default --no-first-run --disable-extensions about:blank
 for i in $(seq 1 20); do pgrep -f -- "--user-data-dir=$ID" >/dev/null && break; sleep 0.5; done; sleep 2
 "$CB" template identity seed "$ACC" > "$TMPROOT/seed2.out" || true
 grep -q "REFUSED" "$TMPROOT/seed2.out" && echo "seed refuses while the identity is open: yes" || { echo "FAIL: seed into an open identity"; exit 1; }

@@ -70,7 +70,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("CLAUDE_BROWSER_CONFIG",
@@ -647,16 +647,40 @@ def app_copy_path(account=None):
     return CHROME_APP_COPY
 
 
+def _build_copy_quietly(path, account):
+    """(Re)build one badged copy; False if it cannot be built right now (no
+    fileicon / Pillow, or the outdated copy is still running)."""
+    if not shutil.which("fileicon"):
+        return False
+    try:
+        return bool(build_one_app(path, icon_for(account)))
+    except SystemExit:
+        return False
+
+
+def badged_app(account=None):
+    """The Chrome app EVERY claude-browser launch uses. Never stock Chrome: a
+    browser that is not the user's main Chrome must show a badge in the Dock
+    (requirement, 2026-10-08). The account's numbered copy if one is built, else
+    the generic copy. A copy that lags the installed Chrome is rebuilt first
+    (copies are APFS clones: instant). If no badged copy can be had, refuse."""
+    want = app_version(CHROME_APP_SRC)
+    cands = ([(os.path.join(APPS_DIR, f"Chrome Claude {account_suffix(account)}.app"), account)] if account else []) \
+        + [(CHROME_APP_COPY, None)]
+    for path, _ in cands:
+        if os.path.isdir(path) and app_version(path) == want:
+            return path
+    for path, acct in cands:
+        if os.path.isdir(path) or acct is None:
+            if _build_copy_quietly(path, acct):
+                return path
+    die("refusing to launch Chrome without a badge: no up-to-date badged Chrome copy, and one could not be "
+        f"built now. Run `claude-browser app build --all` (needs fileicon and Pillow or uv), or quit any "
+        f"outdated copy that is still running.", 3)
+
+
 def chrome_app_for_launch(account=None):
-    """Prefer the icon-bearing copy (per-account if built) when it matches the
-    installed Chrome version; otherwise the stock app (and say so)."""
-    p = app_copy_path(account)
-    if os.path.isdir(p):
-        if app_version(p) == app_version(CHROME_APP_SRC):
-            return p
-        print(f"  note: {p} is version {app_version(p)} but Chrome is {app_version(CHROME_APP_SRC)}; "
-              f"run `claude-browser app build` — launching the stock app for now")
-    return CHROME_APP
+    return badged_app(account)
 
 
 def make_icon(out, account=None, label=None, sublabel=None):
@@ -798,7 +822,7 @@ def _prepare_new_base():
 def _run_base_window(new, urls, wait, steps):
     """Open Chrome on NEW and wait for the human to quit it. No early exit
     before Chrome is up: a slow start must not look like a finished window."""
-    launch(new, urls, app=CHROME_APP)
+    launch(new, urls, app=badged_app(None))
     print(steps + f"\nWaiting up to {wait}s…")
     t0 = time.time()
     while not chrome_pids(new) and time.time() - t0 < 60:
@@ -1649,11 +1673,13 @@ def quit_identity(d):
 
 
 def launch_identity(d, url, hidden):
-    """Stock Chrome (not the Dock-app copies), extensions off. hidden: `open -g -j`.
-    The caller has marked the identity's Chrome (_mark_identity_chrome)."""
+    """A badged Chrome copy (the account's, else the generic one; never stock
+    Chrome, even hidden: it still shows in the Dock), extensions off. hidden:
+    `open -g -j`. The caller has marked the identity's Chrome (_mark_identity_chrome)."""
     reset_device_id(d)
     clean_start(d)
-    subprocess.run(["open"] + (["-g", "-j"] if hidden else []) + ["-na", CHROME_APP_SRC, "--args",
+    app = badged_app(os.path.basename(os.path.dirname(d)))
+    subprocess.run(["open"] + (["-g", "-j"] if hidden else []) + ["-na", app, "--args",
                     f"--user-data-dir={d}", "--profile-directory=Default",
                     "--no-first-run", "--no-default-browser-check", "--disable-extensions",
                     "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", url], check=False)
@@ -1955,7 +1981,7 @@ def gc_identity():
     return 1
 
 
-RELAY_SECONDS = 240     # a fresh browser registers on the relay within ~1–4 min (observed)
+RELAY_SECONDS = 480     # a fresh browser registers on the relay within ~1–8 min (observed: up to 7 min)
 
 
 def relay_hint(launched_at):
@@ -1963,7 +1989,7 @@ def relay_hint(launched_at):
     is not on the relay yet, and select_browser fails until it is."""
     age = time.time() - launched_at if launched_at else None
     if age is not None and age < RELAY_SECONDS:
-        return (f"  This browser was launched {int(age)} s ago and registers on the relay within ~1–4 min.\n"
+        return (f"  This browser was launched {int(age)} s ago and registers on the relay within ~1–8 min.\n"
                 f"  Poll list_connected_browsers (every ~15 s, up to {RELAY_SECONDS // 60} min) until the id below is "
                 f"listed, THEN select_browser. \"No connected browser has deviceId\" before that means: keep waiting, "
                 f"you are not blocked, do not run `down`.")

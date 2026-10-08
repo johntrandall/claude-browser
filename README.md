@@ -129,7 +129,7 @@ up: account=work purpose=tickets session=7f3e9a10-… from=tmux:%3 sites=example
 NEXT (in the agent): list_connected_browsers → select_browser deviceId=a1b2c3d4-…
 ```
 
-The agent then calls `select_browser` with that id and works in its own tabs, closing them when done. A second agent on `work` gets `attached to the work browser` and the same device id. A browser launched in the last few minutes is not on the relay yet; `up` says so, and agents poll `list_connected_browsers` until the id appears (about 1–4 minutes) before selecting it. When a session ends, the SessionEnd hook runs `claude-browser down <session>`, which detaches it; the last one out tears the browser down.
+The agent then calls `select_browser` with that id and works in its own tabs, closing them when done. A second agent on `work` gets `attached to the work browser` and the same device id. A browser launched in the last few minutes is not on the relay yet; `up` says so, and agents poll `list_connected_browsers` until the id appears (about 1–8 minutes) before selecting it. When a session ends, the SessionEnd hook runs `claude-browser down <session>`, which detaches it; the last one out tears the browser down.
 
 **One limit of sharing:** Chrome cannot take new cookies while it runs. An agent that attaches gets the sites grafted at launch; for any of its `--sites` not covered, `up` prints a note, and the agent (or you) logs in to that site in the window. That login then lasts for the browser's lifetime.
 
@@ -161,6 +161,10 @@ The extension signs in off the claude.ai session cookie in its profile. Its pair
 **How it stays fresh.** `gc` (every 15 minutes under `brew services`) refreshes at most one identity per run: the one longest unrefreshed, once that is longer than `identity_refresh_hours`. A refresh opens the identity hidden (`open -g -j`, stock Chrome, extensions disabled) on claude.ai for `identity_refresh_seconds`. It then quits it and logs an `identity-refresh` event with the expiry before and after (`identity-stale` when no `sessionKey` is left). Whether loading claude.ai moves that expiry forward is not assumed; the events show what happened. Each identity Chrome's starter (process and start time) is recorded before it launches, so `gc` quits one whose starter died (a `gc` killed mid-wait, say) once it has been open longer than a refresh.
 
 **How a refresh and `up` stay apart.** The refresh decides and launches under the same lock `up` uses, and it skips an account whose agent browser is mid-launch: that is when `up` copies from the identity. The wait runs outside the lock, so an `up` during it is not blocked. It copies whatever login Chrome has written to disk at that moment.
+
+## Every launched Chrome is badged
+
+claude-browser never launches stock Google Chrome. Every window it opens comes from a badged copy of Chrome, with its own Dock icon. That covers agent browsers, pairing windows, base rebuild / add-extension windows and the golden-identity windows (a "hidden" refresh still shows in the Dock). A launched Chrome therefore can never be mistaken for your main browser. The copy is the account's numbered copy if built, otherwise the generic one; a copy older than the installed Chrome is rebuilt first. If no badged copy can be built (`fileicon` or Pillow missing, or an outdated copy still running), the launch refuses with instructions.
 
 ## Security model
 

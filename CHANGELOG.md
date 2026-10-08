@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 — 2026-10-08
+
+- Every Chrome claude-browser launches is a badged copy: agent browsers, pairing windows, base rebuild / add-extension windows, and golden-identity windows (even hidden ones, which still show in the Dock). An outdated copy is rebuilt first; if no badged copy can be had, the launch refuses. Stock Chrome is never launched.
+
 ## 0.3.1 — 2026-10-08
 
 - When the template is not ready, `up` tells the agent to stop and report, never to select another browser (an agent refused for days fell back to the human's own Chrome profile).
