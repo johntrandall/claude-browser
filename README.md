@@ -1,6 +1,9 @@
-# claude-browser
+# claude-browser-pool
 
 One throwaway Chrome per Claude account on macOS, shared by every Claude Code agent on that account, each agent in its own tab group. It starts on demand, already signed in to claude.ai and paired with the Claude in Chrome extension, carries only the site logins agents asked for, and is deleted when the last agent is done.
+
+The repository is `claude-browser-pool`; the command it installs is `claude-browser` (Homebrew formula `johntrandall/tap/claude-browser`).
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -258,7 +261,7 @@ Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
-Issues and pull requests are welcome at https://github.com/johntrandall/claude-browser. Please include `claude-browser config` output (redact profile names if you like) and the relevant `claude-browser events --since 1` lines with a bug report.
+Issues and pull requests are welcome at https://github.com/johntrandall/claude-browser-pool. Please include `claude-browser config` output (redact profile names if you like) and the relevant `claude-browser events --since 1` lines with a bug report.
 
 Run `bash tests/test-mechanics.sh` before sending a change. It builds a throwaway base under a temporary root and runs clone, launch, list and teardown. It opens Chrome briefly and needs no login.
 
